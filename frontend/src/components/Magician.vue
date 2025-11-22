@@ -15,9 +15,29 @@ interface ChatLayer {
   visible: boolean;
 }
 
+interface ImageLayer {
+  id: number;
+  name: string;
+  src: string | null;
+  transform: { x: number; y: number; scale: number; rotation: number };
+  opacity: number;
+  visible: boolean;
+}
+
+const normalizeTransform = (t?: Partial<{ x: number; y: number; scale: number; rotation: number }>) => ({
+  x: Number.isFinite(t?.x) ? t!.x! : 0,
+  y: Number.isFinite(t?.y) ? t!.y! : 0,
+  scale: Number.isFinite(t?.scale) && t!.scale! > 0 ? t!.scale! : 1,
+  rotation: Number.isFinite(t?.rotation) ? t!.rotation! : 0,
+});
+
 const chatLayers = ref<ChatLayer[]>([]);
 const selectedChatLayerId = ref<number | null>(null);
 let nextChatLayerId = 1;
+
+const imageLayers = ref<ImageLayer[]>([]);
+const selectedImageLayerId = ref<number | null>(null);
+let nextImageLayerId = 1;
 
 const createChatLayer = (options?: Partial<ChatLayer>) => {
   const layer: ChatLayer = {
@@ -37,6 +57,31 @@ const activeChatLayer = computed(() => {
   return chatLayers.value.find(layer => layer.id === selectedChatLayerId.value) || chatLayers.value[0];
 });
 
+const createImageLayer = (options?: Partial<ImageLayer>) => {
+  const layer: ImageLayer = {
+    id: options?.id ?? nextImageLayerId++,
+    name: options?.name || `Image ${imageLayers.value.length + 1}`,
+    src: options?.src ?? null,
+    transform: normalizeTransform(options?.transform),
+    opacity: Number.isFinite(options?.opacity) ? (options!.opacity as number) : 1,
+    visible: options?.visible ?? true
+  };
+  imageLayers.value.push(layer);
+  return layer;
+};
+
+const selectImageLayer = (id: number) => {
+  const layer = imageLayers.value.find(l => l.id === id);
+  if (!layer) return;
+  selectedImageLayerId.value = id;
+  Object.assign(imageTransform, normalizeTransform(layer.transform));
+};
+
+const activeImageLayer = computed(() => {
+  if (selectedImageLayerId.value === null) return imageLayers.value[0];
+  return imageLayers.value.find(layer => layer.id === selectedImageLayerId.value) || imageLayers.value[0];
+});
+
 const chatlogText = computed({
   get: () => activeChatLayer.value?.text || '',
   set: (val: string) => {
@@ -51,11 +96,22 @@ if (chatLayers.value.length === 0) {
   const initialLayer = createChatLayer({ name: 'Layer 1' });
   selectedChatLayerId.value = initialLayer.id;
 }
+if (imageLayers.value.length === 0) {
+  const initialImg = createImageLayer({ name: 'Image 1' });
+  selectedImageLayerId.value = initialImg.id;
+}
 
 const ensureActiveLayer = (): ChatLayer => {
   if (activeChatLayer.value) return activeChatLayer.value;
   const newLayer = createChatLayer({ name: `Layer ${chatLayers.value.length + 1}` });
   selectedChatLayerId.value = newLayer.id;
+  return newLayer;
+};
+
+const ensureActiveImageLayer = (): ImageLayer => {
+  if (activeImageLayer.value) return activeImageLayer.value;
+  const newLayer = createImageLayer({ name: `Image ${imageLayers.value.length + 1}` });
+  selectedImageLayerId.value = newLayer.id;
   return newLayer;
 };
 const droppedImageSrc = ref<string | null>(null); // To store the image data URL
@@ -101,6 +157,27 @@ const isPanning = ref(false);
 const panStart = reactive({ x: 0, y: 0 });
 const panStartImagePos = reactive({ x: 0, y: 0 });
 
+watch(activeImageLayer, (layer) => {
+  if (!layer) return;
+  Object.assign(imageTransform, normalizeTransform(layer.transform));
+}, { immediate: true });
+
+const getPreviewScale = () => {
+  const dz = dropZoneRef.value;
+  if (dz && dropZoneWidth.value && dropZoneHeight.value) {
+    const scaleX = dz.clientWidth / dropZoneWidth.value;
+    const scaleY = dz.clientHeight / dropZoneHeight.value;
+    return Math.min(scaleX, scaleY) || 1;
+  }
+  return dropzoneScale.value || 1;
+};
+
+watch(imageTransform, (val) => {
+  if (activeImageLayer.value) {
+    Object.assign(activeImageLayer.value.transform, normalizeTransform(val));
+  }
+}, { deep: true });
+
 // --- Chat Manipulation State ---
 const isChatDraggingEnabled = ref(false);
 const chatTransform = reactive({ x: 0, y: 0, scale: 1 });
@@ -122,6 +199,7 @@ watch(chatTransform, (val) => {
 
 // --- Scale Adjustment for Drop Zone Visibility ---
 const contentAreaRef = ref<HTMLElement | null>(null); // Reference to content area div
+const dropZoneRef = ref<HTMLElement | null>(null); // Reference to dropzone for accurate scaling
 const dropzoneScale = ref(1); // Scale factor for the dropzone to fit screen
 const isScaledDown = ref(false); // Flag to track if the dropzone is scaled down
 
@@ -495,11 +573,12 @@ const handleFileSelect = (event: Event) => {
     if (file.type.startsWith('image/')) {
       const reader = new FileReader();
       reader.onload = (e) => {
-        droppedImageSrc.value = e.target?.result as string;
-        // Reset image transform
-        imageTransform.x = 0;
-        imageTransform.y = 0;
-        imageTransform.scale = 1;
+        const layer = ensureActiveImageLayer();
+        layer.src = e.target?.result as string;
+        layer.transform = normalizeTransform(layer.transform);
+        selectedImageLayerId.value = layer.id;
+        droppedImageSrc.value = layer.src;
+        Object.assign(imageTransform, layer.transform);
       };
       reader.readAsDataURL(file);
     } else {
@@ -591,45 +670,66 @@ const handleDrop = (event: DragEvent) => {
 
   const reader = new FileReader();
   reader.onload = (e) => {
-    droppedImageSrc.value = e.target?.result as string;
-    imageTransform.x = 0;
-    imageTransform.y = 0;
-    imageTransform.scale = 1;
+    const layer = ensureActiveImageLayer();
+    layer.src = e.target?.result as string;
+    layer.transform = normalizeTransform(layer.transform);
+    selectedImageLayerId.value = layer.id;
+    droppedImageSrc.value = layer.src;
+    Object.assign(imageTransform, layer.transform);
   };
   reader.readAsDataURL(file);
 };
 
 // --- Image Panning Handlers ---
 const handleImageMouseDown = (event: MouseEvent) => {
-  if (!isImageDraggingEnabled.value || !droppedImageSrc.value) return;
+  if (!isImageDraggingEnabled.value || !hasImages.value) return;
+  const layer = activeImageLayer.value;
+  if (!layer) return;
   event.preventDefault();
   isPanning.value = true;
   panStart.x = event.clientX;
   panStart.y = event.clientY;
-  panStartImagePos.x = imageTransform.x;
-  panStartImagePos.y = imageTransform.y;
+  panStartImagePos.x = layer.transform.x;
+  panStartImagePos.y = layer.transform.y;
   // Add a class to body to prevent text selection during drag
   document.body.style.userSelect = 'none';
+  document.addEventListener('mousemove', handleImageMouseMoveDocument);
+  document.addEventListener('mouseup', handleImageMouseUpDocument);
 };
 
 const handleImageMouseMove = (event: MouseEvent) => {
   if (!isPanning.value) return;
+  const layer = activeImageLayer.value;
+  if (!layer) return;
   const deltaX = event.clientX - panStart.x;
   const deltaY = event.clientY - panStart.y;
-  imageTransform.x = panStartImagePos.x + deltaX;
-  imageTransform.y = panStartImagePos.y + deltaY;
+  const scaleFactor = getPreviewScale() * (layer.transform.scale || 1);
+  layer.transform.x = panStartImagePos.x + deltaX / scaleFactor;
+  layer.transform.y = panStartImagePos.y + deltaY / scaleFactor;
+  Object.assign(imageTransform, layer.transform);
+};
+
+const handleImageMouseMoveDocument = (event: MouseEvent) => {
+  handleImageMouseMove(event);
 };
 
 const handleImageMouseUpOrLeave = () => {
-  if (isPanning.value) {
-    isPanning.value = false;
-    document.body.style.userSelect = ''; // Re-enable text selection
-  }
+  if (!isPanning.value) return;
+  isPanning.value = false;
+  document.body.style.userSelect = ''; // Re-enable text selection
+  document.removeEventListener('mousemove', handleImageMouseMoveDocument);
+  document.removeEventListener('mouseup', handleImageMouseUpDocument);
+};
+
+const handleImageMouseUpDocument = () => {
+  handleImageMouseUpOrLeave();
 };
 
 // --- Image Zoom Handler ---
 const handleWheel = (event: WheelEvent) => {
-  if (!isImageDraggingEnabled.value || !droppedImageSrc.value) return;
+  if (!isImageDraggingEnabled.value || !hasImages.value) return;
+  const layer = activeImageLayer.value;
+  if (!layer) return;
   event.preventDefault();
   const scaleAmount = 0.1;
   const minScale = 0.1;
@@ -637,11 +737,12 @@ const handleWheel = (event: WheelEvent) => {
 
   if (event.deltaY < 0) {
     // Zoom in
-    imageTransform.scale = Math.min(maxScale, imageTransform.scale + scaleAmount);
+    layer.transform.scale = Math.min(maxScale, layer.transform.scale + scaleAmount);
   } else {
     // Zoom out
-    imageTransform.scale = Math.max(minScale, imageTransform.scale - scaleAmount);
+    layer.transform.scale = Math.max(minScale, layer.transform.scale - scaleAmount);
   }
+  Object.assign(imageTransform, layer.transform);
 };
 
 // --- Toolbar Button Handlers ---
@@ -670,6 +771,8 @@ const handleChatMouseDown = (event: MouseEvent) => {
   chatPanStartPos.x = chatTransform.x;
   chatPanStartPos.y = chatTransform.y;
   document.body.style.userSelect = 'none';
+  document.addEventListener('mousemove', handleChatMouseMoveDocument);
+  document.addEventListener('mouseup', handleChatMouseUpDocument);
 };
 
 const handleChatMouseMove = (event: MouseEvent) => {
@@ -691,7 +794,17 @@ const handleChatMouseUpOrLeave = (event?: MouseEvent) => {
     }
     isChatPanning.value = false;
     document.body.style.userSelect = '';
+    document.removeEventListener('mousemove', handleChatMouseMoveDocument);
+    document.removeEventListener('mouseup', handleChatMouseUpDocument);
   }
+};
+
+const handleChatMouseMoveDocument = (event: MouseEvent) => {
+  handleChatMouseMove(event);
+};
+
+const handleChatMouseUpDocument = () => {
+  handleChatMouseUpOrLeave();
 };
 
 // --- Chat Zoom Handler ---
@@ -825,7 +938,7 @@ const chatStyles = computed(() => {
     fontFamily: '"Arial Black", Arial, sans-serif',
     fontSize: '12px',
     lineHeight: '16px',
-    transform: `translate(${layer.transform.x}px, ${layer.transform.y}px) scale(${layer.transform.scale})`,
+    transform: `translate(${layer.transform.x * getPreviewScale()}px, ${layer.transform.y * getPreviewScale()}px) scale(${layer.transform.scale})`,
     transformOrigin: 'top left',
     pointerEvents: (isChatDraggingEnabled.value && layer.id === activeChatLayer.value?.id ? 'auto' : 'none') as 'auto' | 'none',
     wordWrap: 'break-word' as const,
@@ -894,9 +1007,11 @@ const buildScreenshotFilename = () => {
   return `${datePart} - ${timePart} - ${finalTheme}.png`;
 };
 
+const hasImages = computed(() => imageLayers.value.some(layer => !!layer.src));
+
 // Update the saveImage function to ensure 1:1 positioning match with preview
 const saveImage = async () => {
-  if (!droppedImageSrc.value) {
+  if (!hasImages.value) {
     console.warn('No image to save');
     return;
   }
@@ -914,35 +1029,46 @@ const saveImage = async () => {
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    ctx.save();
-    const img = new Image();
-    img.src = droppedImageSrc.value;
-    await new Promise((resolve, reject) => {
-      img.onload = resolve;
-      img.onerror = reject;
-    });
+    const displayScale = getPreviewScale();
 
-    const viewportRatio = canvas.width / canvas.height;
-    const imageRatio = img.naturalWidth / img.naturalHeight;
-    let drawWidth, drawHeight, offsetX, offsetY;
+    // Draw all visible images in order
+    for (const layer of imageLayers.value) {
+      if (!layer.src || !layer.visible) continue;
+      ctx.save();
+      const t = normalizeTransform(layer.transform);
+      const img = new Image();
+      img.src = layer.src;
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+      });
 
-    if (imageRatio > viewportRatio) {
-      drawWidth = canvas.width;
-      drawHeight = canvas.width / imageRatio;
-      offsetX = 0;
-      offsetY = (canvas.height - drawHeight) / 2;
-    } else {
-      drawHeight = canvas.height;
-      drawWidth = canvas.height * imageRatio;
-      offsetX = (canvas.width - drawWidth) / 2;
-      offsetY = 0;
+      const viewportRatio = canvas.width / canvas.height;
+      const imageRatio = img.naturalWidth / img.naturalHeight;
+      let drawWidth, drawHeight, offsetX, offsetY;
+
+      if (imageRatio > viewportRatio) {
+        drawWidth = canvas.width;
+        drawHeight = canvas.width / imageRatio;
+        offsetX = 0;
+        offsetY = (canvas.height - drawHeight) / 2;
+      } else {
+        drawHeight = canvas.height;
+        drawWidth = canvas.height * imageRatio;
+        offsetX = (canvas.width - drawWidth) / 2;
+        offsetY = 0;
+      }
+
+      ctx.translate(offsetX + drawWidth / 2, offsetY + drawHeight / 2);
+      ctx.translate(t.x, t.y);
+      ctx.rotate((t.rotation * Math.PI) / 180);
+      ctx.scale(t.scale, t.scale);
+      const prevAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = layer.opacity ?? 1;
+      ctx.drawImage(img, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+      ctx.globalAlpha = prevAlpha;
+      ctx.restore();
     }
-
-    ctx.translate(offsetX + drawWidth / 2, offsetY + drawHeight / 2);
-    ctx.scale(imageTransform.scale, imageTransform.scale);
-    ctx.translate(imageTransform.x, imageTransform.y);
-    ctx.drawImage(img, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
-    ctx.restore();
 
     const visibleChatLayers = chatLayers.value.filter(layer => layer.visible && layer.parsedLines.length > 0);
     for (const layer of visibleChatLayers) {
@@ -1192,9 +1318,10 @@ const saveImage = async () => {
 const resetSession = () => {
   // Reset image and transform
   droppedImageSrc.value = null;
-  imageTransform.x = 0;
-  imageTransform.y = 0;
-  imageTransform.scale = 1;
+  imageLayers.value = [];
+  const imgLayer = createImageLayer({ name: 'Image 1' });
+  selectedImageLayerId.value = imgLayer.id;
+  Object.assign(imageTransform, imgLayer.transform);
   
   // Reset image dragging state
   isImageDraggingEnabled.value = false;
@@ -1207,6 +1334,7 @@ const resetSession = () => {
   const defaultLayer = createChatLayer({ name: 'Layer 1' });
   selectedChatLayerId.value = defaultLayer.id;
   Object.assign(chatTransform, defaultLayer.transform);
+  renderKey.value++;
   
   // Reset drop zone dimensions to defaults
   dropZoneWidth.value = 800;
@@ -1427,11 +1555,20 @@ const saveEditorState = () => {
     characterName: characterName.value,
     chatLayers: chatLayers.value.map(layer => ({
       id: layer.id,
+    name: layer.name,
+    text: layer.text,
+    transform: { ...layer.transform },
+    visible: layer.visible
+  })),
+    imageLayers: imageLayers.value.map(layer => ({
+      id: layer.id,
       name: layer.name,
-      text: layer.text,
+      src: layer.src,
       transform: { ...layer.transform },
+      opacity: layer.opacity,
       visible: layer.visible
     })),
+    selectedImageLayerId: selectedImageLayerId.value,
     selectedChatLayerId: selectedChatLayerId.value,
     dropZoneWidth: dropZoneWidth.value,
     dropZoneHeight: dropZoneHeight.value,
@@ -1476,6 +1613,25 @@ const loadEditorState = () => {
       chatLineWidth.value = state.chatLineWidth || 640;
       screenshotTheme.value = state.screenshotTheme || '';
       alwaysPromptSaveLocation.value = state.alwaysPromptSaveLocation || false;
+
+      imageLayers.value = [];
+      if (state.imageLayers && Array.isArray(state.imageLayers)) {
+        for (const layer of state.imageLayers) {
+          const restored = createImageLayer({
+            id: layer.id,
+            name: layer.name,
+            src: layer.src,
+            transform: normalizeTransform(layer.transform),
+            opacity: layer.opacity,
+            visible: layer.visible
+          });
+          nextImageLayerId = Math.max(nextImageLayerId, restored.id + 1);
+        }
+        const fallbackImgId = state.selectedImageLayerId ?? (imageLayers.value[0]?.id ?? null);
+        if (fallbackImgId !== null) {
+          selectedImageLayerId.value = fallbackImgId;
+        }
+      }
 
       if (state.chatLayers && Array.isArray(state.chatLayers)) {
         chatLayers.value = [];
@@ -1539,7 +1695,9 @@ watch([
   stripTimestamps,
   chatLineWidth,
   screenshotTheme,
-  alwaysPromptSaveLocation
+  alwaysPromptSaveLocation,
+  imageLayers,
+  selectedImageLayerId
 ], () => {
   saveEditorState();
 }, { deep: true });
@@ -1565,7 +1723,7 @@ onMounted(() => {
 
 // Add this new method to handle the click on drop zone
 const handleDropZoneClick = (event: Event) => {
-  if (!droppedImageSrc.value) {
+  if (!hasImages.value) {
     triggerFileInput();
   }
 };
@@ -1767,12 +1925,12 @@ const handleDropZoneClick = (event: Event) => {
           </template>
         </v-tooltip>
         <v-tooltip text="Save Image" location="bottom">
-          <template v-slot:activator="{ props }">
+            <template v-slot:activator="{ props }">
             <v-btn 
               v-bind="props" 
               icon="mdi-content-save-outline"
               @click="saveImage"
-              :disabled="!droppedImageSrc"
+              :disabled="!hasImages"
             ></v-btn>
           </template>
         </v-tooltip>
@@ -1844,13 +2002,14 @@ const handleDropZoneClick = (event: Event) => {
       <div class="main-content" ref="contentAreaRef" :style="{ width: mainContentFlexBasis }">
         <!-- Add aspect ratio container to enforce proper ratio -->
         <div class="aspect-ratio-container" :style="aspectRatioContainerStyle">
-          <v-sheet 
+            <v-sheet 
             class="drop-zone d-flex align-center justify-center pa-0"
             :class="{ 
               'is-dragging-over': isDraggingOverDropZone,
               'clickable': !droppedImageSrc 
             }" 
             :style="dropZoneStyle as CSSProperties"
+            ref="dropZoneRef"
             @dragover.prevent.stop="handleDragOver"
             @dragleave="handleDragLeave"
             @dragenter.prevent.stop="handleDragOver"
@@ -1866,21 +2025,36 @@ const handleDropZoneClick = (event: Event) => {
               {{ scaleIndicator }}
             </div>
             
-            <!-- Display Dropped Image -->
-            <img 
-              v-if="droppedImageSrc"
-              :src="droppedImageSrc" 
-              alt="Dropped Screenshot"
-              class="dropped-image"
-              :style="imageStyle as CSSProperties"
-              draggable="false" 
-              @mousedown="handleImageMouseDown"
-              @mousemove="handleImageMouseMove"
-              @mouseup="handleImageMouseUpOrLeave"
-              @mouseleave="handleImageMouseUpOrLeave"
-            />
+            <!-- Display Images -->
+            <template v-for="layer in imageLayers">
+              <img 
+                v-if="layer.src && layer.visible"
+                :key="`image-layer-${layer.id}`"
+                :src="layer.src" 
+                :alt="layer.name"
+                class="dropped-image"
+                :style="{
+                  maxWidth: 'none',
+                  maxHeight: 'none',
+                  position: 'absolute',
+                  top: '0',
+                  left: '0',
+                  transformOrigin: 'center center',
+                  transform: `translate(${layer.transform.x * getPreviewScale()}px, ${layer.transform.y * getPreviewScale()}px) rotate(${layer.transform.rotation}deg) scale(${layer.transform.scale})`,
+                  cursor: isImageDraggingEnabled ? (isPanning ? 'grabbing' : 'grab') : 'default',
+                  transition: isPanning ? 'none' : 'transform 0.1s ease-out',
+                  opacity: layer.visible ? layer.opacity ?? 1 : 0.25,
+                  filter: layer.visible ? 'none' : 'grayscale(1)'
+                }"
+                draggable="false" 
+                @mousedown="(ev) => { selectImageLayer(layer.id); handleImageMouseDown(ev); }"
+                @mousemove="handleImageMouseMove"
+                @mouseup="handleImageMouseUpOrLeave"
+                @mouseleave="handleImageMouseUpOrLeave"
+              />
+            </template>
             <!-- Display Placeholder -->
-            <div v-else class="text-center">
+            <div v-if="!hasImages" class="text-center">
               <v-icon size="x-large" color="grey-darken-1">mdi-paperclip</v-icon>
               <div class="text-grey-darken-1 mt-2">Click or drag and drop your screenshot here</div>
             </div>
@@ -1888,13 +2062,12 @@ const handleDropZoneClick = (event: Event) => {
             <!-- Chat Overlay with fixed-width wrapping -->
             <template v-for="layer in chatLayers">
               <div
-                v-if="droppedImageSrc && layer && layer.visible && layer.parsedLines && layer.parsedLines.length > 0"
+                v-if="hasImages && layer && layer.visible && layer.parsedLines && layer.parsedLines.length > 0"
                 :key="`chat-layer-${layer.id}-${renderKey}`"
                 class="chat-overlay"
                 @mousedown="handleChatMouseDown"
                 @mousemove="handleChatMouseMove"
                 @mouseup="handleChatMouseUpOrLeave"
-                @mouseleave="handleChatMouseUpOrLeave"
                 @wheel="handleChatWheel"
                 :style="chatStyles(layer)"
               >
@@ -1926,12 +2099,78 @@ const handleDropZoneClick = (event: Event) => {
       <!-- Right side chatlog panel -->
       <div class="chatlog-panel" ref="chatPanelRef" :style="{ width: chatPanelFlexBasis }">
         <v-sheet class="fill-height d-flex flex-column pa-2" style="border-radius: 4px;">
+          <div class="text-subtitle-1 mb-2">Images</div>
+          <div class="mb-3" style="max-height: 120px; overflow-y: auto;">
+            <v-list density="compact" bg-color="transparent">
+              <v-list-item
+                v-for="(layer, index) in imageLayers"
+                :key="layer.id"
+                :active="layer.id === activeImageLayer?.id"
+                @click="selectedImageLayerId = layer.id"
+              >
+                <template #prepend>
+                  <v-btn
+                    icon
+                    size="small"
+                variant="tonal"
+                :color="layer.visible ? 'primary' : 'grey-darken-1'"
+                :icon="layer.visible ? 'mdi-eye-outline' : 'mdi-eye-off-outline'"
+                @click.stop="layer.visible = !layer.visible; renderKey++"
+              ></v-btn>
+            </template>
+                <v-text-field
+                  v-model="layer.name"
+                  variant="underlined"
+                  density="compact"
+                  hide-details
+                  class="mx-2"
+                  placeholder="Image name"
+                ></v-text-field>
+                <template #append>
+                  <v-btn icon size="small" variant="text" :disabled="index === 0" @click.stop="[imageLayers[index - 1], imageLayers[index]] = [imageLayers[index], imageLayers[index - 1]]; renderKey++">
+                    <v-icon size="small">mdi-arrow-up</v-icon>
+                  </v-btn>
+                  <v-btn icon size="small" variant="text" :disabled="index === imageLayers.length - 1" @click.stop="[imageLayers[index + 1], imageLayers[index]] = [imageLayers[index], imageLayers[index + 1]]; renderKey++">
+                    <v-icon size="small">mdi-arrow-down</v-icon>
+                  </v-btn>
+                  <v-btn icon size="small" variant="text" :disabled="imageLayers.length === 1" @click.stop="imageLayers.splice(index,1); renderKey++">
+                    <v-icon size="small">mdi-delete-outline</v-icon>
+                  </v-btn>
+                </template>
+              </v-list-item>
+            </v-list>
+            <v-btn block size="small" variant="tonal" class="mt-1" @click="() => { const l = createImageLayer({ name: `Image ${imageLayers.length + 1}` }); selectedImageLayerId = l.id; }">Add Image Layer</v-btn>
+            <div v-if="activeImageLayer" class="mt-2">
+              <v-slider
+                v-model="activeImageLayer.opacity"
+                :min="0"
+                :max="1"
+                :step="0.05"
+                density="compact"
+                hide-details
+                thumb-label="always"
+                label="Opacity"
+              ></v-slider>
+              <v-slider
+                v-model="activeImageLayer.transform.rotation"
+                :min="-180"
+                :max="180"
+                :step="1"
+                density="compact"
+                hide-details
+                thumb-label="always"
+                label="Rotation"
+                class="mt-2"
+              ></v-slider>
+            </div>
+          </div>
+
           <div class="d-flex align-center mb-1">
             <div class="text-subtitle-1">Chat Layers</div>
             <v-spacer></v-spacer>
             <v-btn icon="mdi-plus" size="small" variant="text" @click="addChatLayer"></v-btn>
           </div>
-          <div class="mb-2" style="max-height: 180px; overflow-y: auto;">
+          <div class="mb-2" style="max-height: 140px; overflow-y: auto;">
             <v-list density="compact" bg-color="transparent">
               <v-list-item
                 v-for="(layer, index) in chatLayers"
@@ -1943,10 +2182,10 @@ const handleDropZoneClick = (event: Event) => {
                   <v-btn
                     icon
                     size="small"
-                    variant="text"
-                    :color="layer.visible ? 'primary' : undefined"
+                    variant="tonal"
+                    color="primary"
                     :icon="layer.visible ? 'mdi-eye-outline' : 'mdi-eye-off-outline'"
-                    @click.stop="layer.visible = !layer.visible"
+                    @click.stop="layer.visible = !layer.visible; renderKey++"
                   ></v-btn>
                 </template>
                 <v-text-field
@@ -1958,13 +2197,13 @@ const handleDropZoneClick = (event: Event) => {
                   placeholder="Layer name"
                 ></v-text-field>
                 <template #append>
-                  <v-btn icon size="small" variant="text" :disabled="index === 0" @click.stop="moveChatLayer(layer.id, 'up')">
+                  <v-btn icon size="small" variant="text" :disabled="index === 0" @click.stop="moveChatLayer(layer.id, 'up'); renderKey++">
                     <v-icon size="small">mdi-arrow-up</v-icon>
                   </v-btn>
-                  <v-btn icon size="small" variant="text" :disabled="index === chatLayers.length - 1" @click.stop="moveChatLayer(layer.id, 'down')">
+                  <v-btn icon size="small" variant="text" :disabled="index === chatLayers.length - 1" @click.stop="moveChatLayer(layer.id, 'down'); renderKey++">
                     <v-icon size="small">mdi-arrow-down</v-icon>
                   </v-btn>
-                  <v-btn icon size="small" variant="text" :disabled="chatLayers.length === 1" @click.stop="removeChatLayer(layer.id)">
+                  <v-btn icon size="small" variant="text" :disabled="chatLayers.length === 1" @click.stop="removeChatLayer(layer.id); renderKey++">
                     <v-icon size="small">mdi-delete-outline</v-icon>
                   </v-btn>
                 </template>
