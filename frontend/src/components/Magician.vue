@@ -6,7 +6,58 @@ import { type CSSProperties } from 'vue';
 import Cookies from 'js-cookie';
 import html2canvas from 'html2canvas';
 
-const chatlogText = ref('');
+interface ChatLayer {
+  id: number;
+  name: string;
+  text: string;
+  parsedLines: ParsedLine[];
+  transform: { x: number; y: number; scale: number };
+  visible: boolean;
+}
+
+const chatLayers = ref<ChatLayer[]>([]);
+const selectedChatLayerId = ref<number | null>(null);
+let nextChatLayerId = 1;
+
+const createChatLayer = (options?: Partial<ChatLayer>) => {
+  const layer: ChatLayer = {
+    id: options?.id ?? nextChatLayerId++,
+    name: options?.name || `Layer ${chatLayers.value.length + 1}`,
+    text: options?.text || '',
+    parsedLines: options?.parsedLines || [],
+    transform: options?.transform || { x: 0, y: 0, scale: 1 },
+    visible: options?.visible ?? true,
+  };
+  chatLayers.value.push(layer);
+  return layer;
+};
+
+const activeChatLayer = computed(() => {
+  if (selectedChatLayerId.value === null) return chatLayers.value[0];
+  return chatLayers.value.find(layer => layer.id === selectedChatLayerId.value) || chatLayers.value[0];
+});
+
+const chatlogText = computed({
+  get: () => activeChatLayer.value?.text || '',
+  set: (val: string) => {
+    if (activeChatLayer.value) {
+      activeChatLayer.value.text = val;
+    }
+  }
+});
+
+// Bootstrap with a default layer
+if (chatLayers.value.length === 0) {
+  const initialLayer = createChatLayer({ name: 'Layer 1' });
+  selectedChatLayerId.value = initialLayer.id;
+}
+
+const ensureActiveLayer = (): ChatLayer => {
+  if (activeChatLayer.value) return activeChatLayer.value;
+  const newLayer = createChatLayer({ name: `Layer ${chatLayers.value.length + 1}` });
+  selectedChatLayerId.value = newLayer.id;
+  return newLayer;
+};
 const droppedImageSrc = ref<string | null>(null); // To store the image data URL
 const isDraggingOverDropZone = ref(false); // Renamed from isDragging for clarity
 const dropZoneWidth = ref<number | null>(800); // Default width
@@ -15,6 +66,9 @@ const fileInputRef = ref<HTMLInputElement | null>(null); // Ref for the file inp
 const chatFileInputRef = ref<HTMLInputElement | null>(null); // New ref for chat file input
 const showNewSessionDialog = ref(false); // Control dialog visibility
 const stripTimestamps = ref(false); // New state for stripping timestamps
+const screenshotTheme = ref(''); // Optional custom name for the saved screenshot
+const alwaysPromptSaveLocation = ref(false); // If true, use the browser save dialog instead of auto-downloading
+const filePickerSupported = computed(() => typeof window !== 'undefined' && 'showSaveFilePicker' in window);
 
 // --- Resizable Chat Panel State ---
 const chatPanelRef = ref<HTMLElement | null>(null);
@@ -31,7 +85,14 @@ interface ParsedLine {
   text: string;
   color?: string;
 }
-const parsedChatLines = ref<ParsedLine[]>([]);
+const parsedChatLines = computed<ParsedLine[]>({
+  get: () => activeChatLayer.value?.parsedLines || [],
+  set: (val: ParsedLine[]) => {
+    if (activeChatLayer.value) {
+      activeChatLayer.value.parsedLines = val;
+    }
+  }
+});
 
 // --- Image Manipulation State ---
 const isImageDraggingEnabled = ref(false);
@@ -46,6 +107,18 @@ const chatTransform = reactive({ x: 0, y: 0, scale: 1 });
 const isChatPanning = ref(false);
 const chatPanStart = reactive({ x: 0, y: 0 });
 const chatPanStartPos = reactive({ x: 0, y: 0 });
+
+// Keep the working transform in sync with the active layer
+watch(activeChatLayer, (layer) => {
+  if (!layer) return;
+  Object.assign(chatTransform, layer.transform);
+}, { immediate: true });
+
+watch(chatTransform, (val) => {
+  if (activeChatLayer.value) {
+    Object.assign(activeChatLayer.value.transform, val);
+  }
+}, { deep: true });
 
 // --- Scale Adjustment for Drop Zone Visibility ---
 const contentAreaRef = ref<HTMLElement | null>(null); // Reference to content area div
@@ -269,9 +342,19 @@ const clearChatlog = () => {
   parsedChatLines.value = []; // Clear parsed lines too
 };
 
-const parseChatlog = () => {
-  const lines = chatlogText.value.split('\n').filter(line => line.trim() !== '');
-  parsedChatLines.value = lines.map((line, index) => {
+const parseChatlog = (layer: ChatLayer | undefined = activeChatLayer.value) => {
+  const targetLayer = layer ?? ensureActiveLayer();
+  targetLayer.visible = true;
+  const sourceText = targetLayer.text || '';
+  if (!sourceText) {
+    targetLayer.parsedLines = [];
+    parsedChatLines.value = [];
+    renderKey.value++;
+    return;
+  }
+
+  const lines = sourceText.split('\n').filter(line => line.trim() !== '');
+  const parsed = lines.map((line, index) => {
     let processedText = line;
     
     // Strip timestamps if the option is enabled
@@ -337,6 +420,58 @@ const parseChatlog = () => {
       color: color || 'white'
     };
   });
+
+  targetLayer.parsedLines = parsed;
+  parsedChatLines.value = parsed;
+  renderKey.value++;
+};
+
+const selectChatLayer = (id: number) => {
+  const layer = chatLayers.value.find(l => l.id === id);
+  if (!layer) {
+    const fallback = ensureActiveLayer();
+    selectedChatLayerId.value = fallback.id;
+    parsedChatLines.value = fallback.parsedLines;
+    chatlogText.value = fallback.text;
+    Object.assign(chatTransform, fallback.transform);
+    return;
+  }
+  selectedChatLayerId.value = id;
+  if (layer.text && layer.parsedLines.length === 0) {
+    parseChatlog(layer);
+  }
+  chatlogText.value = layer.text;
+  parsedChatLines.value = layer.parsedLines;
+  Object.assign(chatTransform, layer.transform);
+  selectedText.lineIndex = -1;
+  selectedText.layerId = -1;
+};
+
+const addChatLayer = () => {
+  const layer = createChatLayer();
+  selectChatLayer(layer.id);
+};
+
+const removeChatLayer = (id: number) => {
+  if (chatLayers.value.length <= 1) return; // Always keep at least one layer
+  const index = chatLayers.value.findIndex(l => l.id === id);
+  if (index === -1) return;
+
+  chatLayers.value.splice(index, 1);
+  censoredRegions.value = censoredRegions.value.filter(region => region.layerId !== id);
+
+  // Select the previous layer or the first one
+  const fallback = chatLayers.value[index - 1] || chatLayers.value[0];
+  selectChatLayer(fallback.id);
+};
+
+const moveChatLayer = (id: number, direction: 'up' | 'down') => {
+  const index = chatLayers.value.findIndex(l => l.id === id);
+  if (index === -1) return;
+  const swapWith = direction === 'up' ? index - 1 : index + 1;
+  if (swapWith < 0 || swapWith >= chatLayers.value.length) return;
+  const layers = chatLayers.value;
+  [layers[index], layers[swapWith]] = [layers[swapWith], layers[index]];
 };
 
 // --- File Handling Methods ---
@@ -413,8 +548,17 @@ const triggerChatFileInput = () => {
 };
 
 // --- Drag and Drop Handlers ---
+const isImageFile = (file: File) => {
+  if (file.type && file.type.startsWith('image/')) return true;
+  return /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(file.name);
+};
+
 const handleDragOver = (event: DragEvent) => {
   event.preventDefault(); // Prevent default behavior
+  event.stopPropagation();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'copy';
+  }
   isDraggingOverDropZone.value = true;
 };
 
@@ -424,27 +568,35 @@ const handleDragLeave = () => {
 
 const handleDrop = (event: DragEvent) => {
   event.preventDefault();
+  event.stopPropagation();
   isDraggingOverDropZone.value = false;
 
-  const files = event.dataTransfer?.files;
-  if (files && files.length > 0) {
-    const file = files[0];
-    // Basic image type validation
-    if (file.type.startsWith('image/')) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        droppedImageSrc.value = e.target?.result as string;
-        // Reset image transform when new image is dropped
-        imageTransform.x = 0;
-        imageTransform.y = 0;
-        imageTransform.scale = 1;
-      };
-      reader.readAsDataURL(file);
-    } else {
-      console.warn('Dropped file is not an image.');
-      // Optionally show an error message to the user
-    }
+  const dt = event.dataTransfer;
+  const file =
+    dt?.files && dt.files.length > 0
+      ? dt.files[0]
+      : Array.from(dt?.items || [])
+        .filter(item => item.kind === 'file')
+        .map(item => item.getAsFile())
+        .find(Boolean) || null;
+
+  if (!file) {
+    console.warn('No files detected on drop.');
+    return;
   }
+  if (!isImageFile(file)) {
+    console.warn('Dropped file is not an image.');
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    droppedImageSrc.value = e.target?.result as string;
+    imageTransform.x = 0;
+    imageTransform.y = 0;
+    imageTransform.scale = 1;
+  };
+  reader.readAsDataURL(file);
 };
 
 // --- Image Panning Handlers ---
@@ -648,14 +800,6 @@ const handleResizeMouseUp = () => {
   console.log("Resize complete");
 };
 
-// Compute chat overlay style
-const chatOverlayStyle = computed(() => ({
-  transform: `translate(${chatTransform.x}px, ${chatTransform.y}px) scale(${chatTransform.scale})`,
-  cursor: isChatDraggingEnabled.value ? (isChatPanning.value ? 'grabbing' : 'grab') : 'default',
-  transition: isChatPanning.value ? 'none' : 'transform 0.1s ease-out',
-  pointerEvents: (isChatDraggingEnabled.value ? 'auto' : 'none') as 'auto' | 'none'
-} as const));
-
 // Replace chatLineStyle with a direct rendering approach
 const chatLineStyle = computed(() => (line: ParsedLine, index: number) => {
   // Hard code basic positioning
@@ -671,24 +815,84 @@ const chatLineStyle = computed(() => (line: ParsedLine, index: number) => {
 
 // Update chat overlay styles
 const chatStyles = computed(() => {
-  return {
+  return (layer: ChatLayer) => ({
     position: 'absolute' as const,
     top: '0',
     left: '0',
     width: '100%',
     height: 'auto',
-    // Force the width to be constrained to enforce wrapping at same break points
     maxWidth: `${dropZoneWidth.value}px`, // Match the exact dropzone width
     fontFamily: '"Arial Black", Arial, sans-serif',
     fontSize: '12px',
     lineHeight: '16px',
-    transform: `translate(${chatTransform.x}px, ${chatTransform.y}px) scale(${chatTransform.scale})`,
+    transform: `translate(${layer.transform.x}px, ${layer.transform.y}px) scale(${layer.transform.scale})`,
     transformOrigin: 'top left',
-    pointerEvents: (isChatDraggingEnabled.value ? 'auto' : 'none') as 'auto' | 'none',
+    pointerEvents: (isChatDraggingEnabled.value && layer.id === activeChatLayer.value?.id ? 'auto' : 'none') as 'auto' | 'none',
     wordWrap: 'break-word' as const,
     whiteSpace: 'pre-wrap' as const,
-  };
+    opacity: layer.visible ? 1 : 0.25,
+    filter: layer.visible ? 'none' : 'grayscale(1)'
+  });
 });
+
+const saveBlobWithFilePicker = async (blob: Blob, filename: string) => {
+  const picker = (window as any).showSaveFilePicker;
+  if (!picker) {
+    throw new Error('File picker not supported');
+  }
+
+  const handle = await picker({
+    suggestedName: filename,
+    types: [
+      {
+        description: 'PNG Image',
+        accept: { 'image/png': ['.png'] }
+      }
+    ]
+  });
+
+  const writable = await (handle as any).createWritable();
+  await writable.write(blob);
+  await writable.close();
+};
+
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
+const saveBlob = async (blob: Blob, filename: string) => {
+  if (alwaysPromptSaveLocation.value && filePickerSupported.value) {
+    try {
+      await saveBlobWithFilePicker(blob, filename);
+      return;
+    } catch (error) {
+      console.warn('Falling back to default download:', error);
+    }
+  }
+
+  downloadBlob(blob, filename);
+};
+
+const buildScreenshotFilename = () => {
+  const now = new Date();
+  const pad = (value: number) => value.toString().padStart(2, '0');
+  const datePart = `${pad(now.getDate())}${pad(now.getMonth() + 1)}${now.getFullYear()}`;
+  const timePart = `${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const rawTheme = screenshotTheme.value.trim();
+  const safeTheme = rawTheme
+    .replace(/[^a-zA-Z0-9\s_-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-');
+  const finalTheme = safeTheme || 'screenshot';
+  return `${datePart} - ${timePart} - ${finalTheme}.png`;
+};
 
 // Update the saveImage function to ensure 1:1 positioning match with preview
 const saveImage = async () => {
@@ -704,15 +908,12 @@ const saveImage = async () => {
       throw new Error('Could not get canvas context');
     }
 
-    // Set canvas size to match the drop zone exactly
     canvas.width = dropZoneWidth.value || 800;
     canvas.height = dropZoneHeight.value || 600;
 
-    // Draw background
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Draw the image with correct positioning and transform origin
     ctx.save();
     const img = new Image();
     img.src = droppedImageSrc.value;
@@ -721,91 +922,55 @@ const saveImage = async () => {
       img.onerror = reject;
     });
 
-    // --- Match CSS object-fit: contain ---
     const viewportRatio = canvas.width / canvas.height;
     const imageRatio = img.naturalWidth / img.naturalHeight;
     let drawWidth, drawHeight, offsetX, offsetY;
 
     if (imageRatio > viewportRatio) {
-      // Image is wider than canvas aspect ratio (letterboxed top/bottom)
       drawWidth = canvas.width;
       drawHeight = canvas.width / imageRatio;
       offsetX = 0;
       offsetY = (canvas.height - drawHeight) / 2;
     } else {
-      // Image is taller than canvas aspect ratio (pillarboxed left/right)
       drawHeight = canvas.height;
       drawWidth = canvas.height * imageRatio;
       offsetX = (canvas.width - drawWidth) / 2;
       offsetY = 0;
     }
 
-    // --- Apply CSS-like transform (translate + scale) with center origin ---
-    // 1. Translate context to the center of the drawing area (where the image is placed by object-fit: contain)
     ctx.translate(offsetX + drawWidth / 2, offsetY + drawHeight / 2);
-    // 2. Apply scaling relative to the center
     ctx.scale(imageTransform.scale, imageTransform.scale);
-    // 3. Apply translation relative to the now scaled and centered origin
     ctx.translate(imageTransform.x, imageTransform.y);
-    // 4. Draw the image centered at the origin (0,0) of the transformed context
-    // The image itself is drawn from its top-left corner (-drawWidth / 2, -drawHeight / 2)
-    // relative to the transformed origin, filling the calculated drawWidth/drawHeight.
     ctx.drawImage(img, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+    ctx.restore();
 
-    ctx.restore(); // Restore context after drawing image
-
-    // If there are chat lines, render them
-    if (parsedChatLines.value.length > 0) {
+    const visibleChatLayers = chatLayers.value.filter(layer => layer.visible && layer.parsedLines.length > 0);
+    for (const layer of visibleChatLayers) {
       ctx.save();
-      
-      // FIXED: Apply chat transform directly without offset
-      // The previous implementation added drop zone position offsets which caused misalignment
-      ctx.translate(chatTransform.x, chatTransform.y);
-      ctx.scale(chatTransform.scale, chatTransform.scale);
+      ctx.translate(layer.transform.x, layer.transform.y);
+      ctx.scale(layer.transform.scale, layer.transform.scale);
 
-      // Set up text rendering to match exactly with the preview
       ctx.font = '700 12px Arial, sans-serif';
       ctx.textBaseline = 'top';
       ctx.textRendering = 'geometricPrecision';
       ctx.letterSpacing = '0px';
-      
       let currentY = 0;
-      const TEXT_OFFSET_Y = 1; // Consistent with preview
-      const MAX_LINE_CHARS = 80; // Same as preview
-
-      // Helper function to get text color based on content (unchanged)
       const getTextColor = (text: string): string => {
-        // Check for radio messages first (since they contain asterisks)
         if (text.includes('[S:') && text.includes('CH:')) return 'rgb(214, 207, 140)';
-        
-        // Check for RP lines (lines starting with *)
         if (text.startsWith('*')) return 'rgb(194, 163, 218)';
-        
-        // Check for car whispers
         if (text.includes('(Car)') && text.includes('whispers:')) return 'rgb(255, 255, 0)';
-        
-        // Check for regular whispers
         if (text.includes('whispers:')) return 'rgb(237, 168, 65)';
-        
-        // Check for cellphone messages - make white if it's the character's message
         if (text.includes('(cellphone)')) {
           if (text.startsWith(characterName.value)) {
             return 'rgb(255, 255, 255)';
           }
           return 'rgb(251, 247, 36)';
         }
-        
-        // Check for megaphone messages
         if (text.includes('[Megaphone]')) return 'rgb(241, 213, 3)';
-        
-        // Check for money messages
         if (text.includes('You paid')) return 'rgb(86, 214, 75)';
-        
-        // Default color
         return 'rgb(255, 255, 255)';
       };
 
-      // Helper function to draw black bar (unchanged)
       const drawBlackBar = (y: number, width: number) => {
         if (showBlackBars.value) {
           ctx.fillStyle = '#000000';
@@ -813,245 +978,210 @@ const saveImage = async () => {
         }
       };
 
-      // Helper functions for text drawing (unchanged)
       const drawTextWithOutline = (text: string, x: number, y: number, color: string, censorType?: CensorType) => {
         const width = ctx.measureText(text).width;
-        const TEXT_OFFSET_Y = 1; // Moved declaration here
+        const TEXT_OFFSET_Y = 1;
 
-        // If black bars are enabled, draw the background first
         if (showBlackBars.value) {
-          // Adjust bar slightly for better coverage around text, matching shadow spread
           ctx.fillStyle = '#000000';
           ctx.fillRect(x - 2, y, width + 4, 16);
         }
 
         if (censorType) {
-          // Define tempCanvas and context locally for blur effect
           const tempCanvas = document.createElement('canvas');
           const tempCtx = tempCanvas.getContext('2d');
-          if (!tempCtx) return; // Guard against null context
+          if (!tempCtx) return;
 
-          // Set temp canvas size slightly larger to accommodate blur filter
-          tempCanvas.width = width + 20; // Add padding for blur
+          tempCanvas.width = width + 20;
           tempCanvas.height = 16 + 20;
 
-          // Draw the text onto the temporary canvas (offset to center it)
           tempCtx.font = ctx.font;
           tempCtx.fillStyle = color;
-          tempCtx.fillText(text, 10, 10 + TEXT_OFFSET_Y); // Draw text with offset
+          tempCtx.fillText(text, 10, 10 + TEXT_OFFSET_Y);
 
-          // Apply blur filter to the temporary canvas
-          tempCtx.globalCompositeOperation = 'source-in'; // Keep original text shape
+          tempCtx.globalCompositeOperation = 'source-in';
           tempCtx.filter = 'blur(4px)';
-          tempCtx.fillStyle = 'black'; // Or use original color if preferred
+          tempCtx.fillStyle = 'black';
           tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-          tempCtx.filter = 'none'; // Reset filter
-          tempCtx.globalCompositeOperation = 'source-over'; // Reset composite operation
+          tempCtx.filter = 'none';
+          tempCtx.globalCompositeOperation = 'source-over';
 
-          // Draw the blurred result back to main canvas
-          // Adjust draw position to account for the padding added to tempCanvas
           ctx.drawImage(tempCanvas, x - 10, y - 10);
-          return; // Make sure to return after drawing blur
+          return;
         }
 
-        // Normal text rendering - mimic CSS text-shadow using multiple fillText calls
         const shadowOffsets = [
           [-1, -1], [-1, 0], [-1, 1],
           [0, -1],           [0, 1],
           [1, -1], [1, 0], [1, 1]
         ];
-        ctx.fillStyle = '#000000'; // Shadow color
+        ctx.fillStyle = '#000000';
         shadowOffsets.forEach(([dx, dy]) => {
-          // Apply the same TEXT_OFFSET_Y to shadows as well for consistency
           ctx.fillText(text, x + dx, y + TEXT_OFFSET_Y + dy);
         });
 
-        // Draw the main text on top
         ctx.fillStyle = color;
         ctx.fillText(text, x, y + TEXT_OFFSET_Y);
       };
 
-      // Other helper functions (unchanged)
-      const getCensorType = (lineIndex: number, startPos: number, length: number): CensorType | undefined => {
-        return censoredRegions.value.find(r => 
+      const getCensorType = (lineIndex: number, startPos: number, length: number, layerId: number): CensorType | undefined => {
+        const region = censoredRegions.value.find(r =>
+          r.layerId === layerId &&
           r.lineIndex === lineIndex &&
-          ((startPos >= r.startOffset && startPos < r.endOffset) || // Start point is within region
-           (startPos + length > r.startOffset && startPos + length <= r.endOffset) || // End point is within region
-           (startPos <= r.startOffset && startPos + length >= r.endOffset)) // Region is completely contained
-        )?.type;
+          ((startPos >= r.startOffset && startPos < r.endOffset) ||
+           (startPos + length > r.startOffset && startPos + length <= r.endOffset) ||
+           (startPos <= r.startOffset && startPos + length >= r.endOffset))
+        );
+        return region?.type;
       };
 
-      const drawSpecialLine = (text: string, x: number, y: number, lineIndex: number) => {
+      const drawSpecialLine = (text: string, x: number, y: number, lineIndex: number, layerId: number): boolean => {
         if (text.includes('[!]')) {
-          // Split the text around [!]
           const parts = text.split(/(\[!\])/);
           let currentX = x;
           let partOffset = 0;
-          
           for (const part of parts) {
             const width = ctx.measureText(part).width;
-            const censorType = getCensorType(lineIndex, partOffset, part.length);
-            if (part === '[!]') {
-              drawTextWithOutline(part, currentX, y, 'rgb(255, 0, 195)', censorType);
-            } else {
-              drawTextWithOutline(part, currentX, y, 'rgb(255, 255, 255)', censorType);
-            }
+            const censorType = getCensorType(lineIndex, partOffset, part.length, layerId);
+            drawTextWithOutline(part, currentX, y, part === '[!]' ? 'rgb(255, 0, 195)' : 'rgb(255, 255, 255)', censorType);
             currentX += width;
             partOffset += part.length;
           }
           return true;
         }
-        
+
         if (text.includes('[Character kill]')) {
-          // Split the text around [Character kill]
           const parts = text.split(/(\[Character kill\])/);
           let currentX = x;
           let partOffset = 0;
-          
           for (const part of parts) {
             const width = ctx.measureText(part).width;
-            const censorType = getCensorType(lineIndex, partOffset, part.length);
-            if (part === '[Character kill]') {
-              drawTextWithOutline(part, currentX, y, 'rgb(56, 150, 243)', censorType);
-            } else {
-              drawTextWithOutline(part, currentX, y, 'rgb(240, 0, 0)', censorType);
-            }
+            const censorType = getCensorType(lineIndex, partOffset, part.length, layerId);
+            drawTextWithOutline(part, currentX, y, part === '[Character kill]' ? 'rgb(56, 150, 243)' : 'rgb(240, 0, 0)', censorType);
             currentX += width;
             partOffset += part.length;
           }
           return true;
         }
-        
+
         return false;
       };
 
-      const drawTextSegment = async (text: string, xPos: number, yPos: number, color: string, lineStartPos: number, lineIndex: number) => {
-        // Split text into censored and uncensored segments
+      const drawTextSegment = async (text: string, xPos: number, yPos: number, color: string, lineStartPos: number, lineIndex: number, layerId: number) => {
         let currentX = xPos;
         let remainingText = text;
         let currentOffset = lineStartPos;
-        
+
         while (remainingText.length > 0) {
-          // Find the next censored region that intersects with our current position
-          const censorRegion = censoredRegions.value.find(r => 
-            r.lineIndex === lineIndex &&
-            r.startOffset <= currentOffset + remainingText.length &&
-            r.endOffset > currentOffset
+          const nextCensor = censoredRegions.value.find(region =>
+            region.layerId === layerId &&
+            region.lineIndex === lineIndex &&
+            ((region.startOffset >= currentOffset && region.startOffset < currentOffset + remainingText.length) ||
+             (region.endOffset > currentOffset && region.endOffset <= currentOffset + remainingText.length))
           );
 
-          if (!censorRegion) {
-            // No more censoring in this segment, draw the rest normally
-            await drawTextWithOutline(remainingText, currentX, yPos, color);
-            break;
-          }
+          if (nextCensor) {
+            const uncensoredLength = nextCensor.startOffset - currentOffset;
+            if (uncensoredLength > 0) {
+              const uncensoredText = remainingText.slice(0, uncensoredLength);
+              drawTextWithOutline(uncensoredText, currentX, yPos, color);
+              currentX += ctx.measureText(uncensoredText).width;
+              currentOffset += uncensoredLength;
+              remainingText = remainingText.slice(uncensoredLength);
+            }
 
-          // Draw uncensored portion before the censored region
-          const uncensoredLength = Math.max(0, censorRegion.startOffset - currentOffset);
-          if (uncensoredLength > 0) {
-            const uncensoredText = remainingText.substring(0, uncensoredLength);
-            await drawTextWithOutline(uncensoredText, currentX, yPos, color);
-            currentX += ctx.measureText(uncensoredText).width;
-            remainingText = remainingText.substring(uncensoredLength);
-            currentOffset += uncensoredLength;
-          }
+            const censoredLength = nextCensor.endOffset - currentOffset;
+            if (censoredLength > 0) {
+              const censoredText = remainingText.slice(0, censoredLength);
+              if (nextCensor.type === CensorType.BlackBar) {
+                const censorWidth = ctx.measureText(censoredText).width;
+                ctx.fillStyle = '#000000';
+                ctx.fillRect(currentX - 2, yPos, censorWidth + 4, 16);
+              } else if (nextCensor.type === CensorType.Blur) {
+                drawTextWithOutline(censoredText, currentX, yPos, color, nextCensor.type);
+              } else if (nextCensor.type === CensorType.Invisible) {
+                const spaceWidth = ctx.measureText(censoredText).width;
+                currentX += spaceWidth;
+              }
 
-          // Draw censored portion
-          const censorLength = Math.min(
-            remainingText.length,
-            censorRegion.endOffset - currentOffset
-          );
-          const censoredText = remainingText.substring(0, censorLength);
-          await drawTextWithOutline(censoredText, currentX, yPos, color, censorRegion.type);
-          currentX += ctx.measureText(censoredText).width;
-          remainingText = remainingText.substring(censorLength);
-          currentOffset += censorLength;
+              currentOffset += censoredLength;
+              remainingText = remainingText.slice(censoredLength);
+              currentX += ctx.measureText(censoredText).width;
+            }
+          } else {
+            if (remainingText.length > 0) {
+              drawTextWithOutline(remainingText, currentX, yPos, color);
+              currentX += ctx.measureText(remainingText).width;
+              remainingText = '';
+            }
+          }
         }
       };
 
-      // Process each line using width-based wrapping to match CSS behavior
       let lineIndex = 0;
-      // FIXED: Use the explicit width from the CSS rule (.chat-line { width: 640px; }) 
-      // minus horizontal padding (4px each side) for accurate wrapping.
-      const maxTextWidth = chatLineWidth.value - 8; 
-
-      for (const line of parsedChatLines.value) {
-        // Get the raw text content, ensuring HTML entities are decoded for measurement
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(line.text, 'text/html');
-        const textContent = doc.body ? doc.body.textContent || '' : line.text; // Use fallback
-
-        // Get the color for this line (using original logic)
-        const textColor = getTextColor(textContent);
-
-        // --- Width-based wrapping logic ---
-        const words = textContent.split(' ');
+      for (const line of layer.parsedLines) {
+        const rawText = stripHtml(line.text);
+        const words = rawText.split(' ');
         let currentLineText = '';
-        let lineStartPosition = 0; // Track character offset within the original line for censoring
+        let lineStartPosition = 0;
+        const maxTextWidth = chatLineWidth.value;
 
-        for (let i = 0; i < words.length; i++) {
-          const word = words[i];
-          // Build the potential next line text (current + space + new word)
+        const fullTextWidth = ctx.measureText(rawText).width;
+        const textColor = line.color || getTextColor(rawText);
+        if (fullTextWidth <= maxTextWidth) {
+          drawBlackBar(currentY, fullTextWidth);
+          if (!drawSpecialLine(rawText, 4, currentY, lineIndex, layer.id)) {
+            await drawTextSegment(rawText, 4, currentY, textColor, lineStartPosition, lineIndex, layer.id);
+          }
+          currentY += 16;
+          lineStartPosition += rawText.length;
+          lineIndex++;
+          continue;
+        }
+
+        for (const word of words) {
           const testLine = currentLineText ? currentLineText + ' ' + word : word;
           const metrics = ctx.measureText(testLine);
 
-          // Check if adding the next word exceeds the max width
           if (metrics.width > maxTextWidth && currentLineText) {
-            // The current line is full (without the new word). Draw it.
             const currentLineWidth = ctx.measureText(currentLineText).width;
-            drawBlackBar(currentY, currentLineWidth); // Draw bar based on measured width
-
-            // Draw the text segment, handling special lines and censoring
-            if (!drawSpecialLine(currentLineText, 4, currentY, lineIndex)) {
-              await drawTextSegment(currentLineText, 4, currentY, textColor, lineStartPosition, lineIndex);
+            drawBlackBar(currentY, currentLineWidth);
+            if (!drawSpecialLine(currentLineText, 4, currentY, lineIndex, layer.id)) {
+              await drawTextSegment(currentLineText, 4, currentY, textColor, lineStartPosition, lineIndex, layer.id);
             }
-
-            // Move to the next line position on the canvas
-            currentY += 16; // Increment Y position based on line height
-
-            // Update the starting character position for the next segment
-            // Length of the drawn line + 1 for the space character that caused the wrap
+            currentY += 16;
             lineStartPosition += currentLineText.length + 1;
-
-            // Start the new line with the word that didn't fit
             currentLineText = word;
-
           } else {
-            // The word fits, add it to the current line
             currentLineText = testLine;
           }
         }
 
-        // After the loop, draw any remaining text in currentLineText
         if (currentLineText) {
           const currentLineWidth = ctx.measureText(currentLineText).width;
           drawBlackBar(currentY, currentLineWidth);
-          if (!drawSpecialLine(currentLineText, 4, currentY, lineIndex)) {
-            await drawTextSegment(currentLineText, 4, currentY, textColor, lineStartPosition, lineIndex);
+          if (!drawSpecialLine(currentLineText, 4, currentY, lineIndex, layer.id)) {
+            await drawTextSegment(currentLineText, 4, currentY, textColor, lineStartPosition, lineIndex, layer.id);
           }
-          currentY += 16; // Increment Y for the last line
+          currentY += 16;
         }
-        // --- End width-based wrapping logic ---
 
-        lineIndex++; // Move to the next original line index (for censoring mapping)
+        lineIndex++;
       }
 
-      ctx.restore(); // Restore context after drawing all chat
-    } // End if (parsedChatLines.value.length > 0)
+      ctx.restore();
+    }
 
-    // Convert to blob and save
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        throw new Error('Failed to create blob');
-      }
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'screenshot.png';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }, 'image/png');
+    const filename = buildScreenshotFilename();
+    const blob = await new Promise((resolve) => {
+      canvas.toBlob(resolve, 'image/png');
+    });
+
+    if (!blob) {
+      throw new Error('Failed to create blob');
+    }
+
+    await saveBlob(blob, filename);
 
   } catch (error) {
     console.error('Error saving image:', error);
@@ -1073,6 +1203,10 @@ const resetSession = () => {
   // Reset chat
   chatlogText.value = '';
   parsedChatLines.value = [];
+  chatLayers.value = [];
+  const defaultLayer = createChatLayer({ name: 'Layer 1' });
+  selectedChatLayerId.value = defaultLayer.id;
+  Object.assign(chatTransform, defaultLayer.transform);
   
   // Reset drop zone dimensions to defaults
   dropZoneWidth.value = 800;
@@ -1088,6 +1222,7 @@ const resetSession = () => {
   // Reset censoring data
   censoredRegions.value = [];
   selectedText.lineIndex = -1;
+  selectedText.layerId = -1;
   selectedText.startOffset = 0;
   selectedText.endOffset = 0;
   selectedText.text = '';
@@ -1119,11 +1254,13 @@ interface CensoredRegion {
   startOffset: number;
   endOffset: number;
   type: CensorType;
+  layerId: number;
 }
 
 // State for censored regions
 const censoredRegions = ref<CensoredRegion[]>([]);
 const selectedText = reactive({
+  layerId: -1,
   lineIndex: -1,
   startOffset: 0,
   endOffset: 0,
@@ -1136,12 +1273,14 @@ const renderKey = ref(0);
 // Update cycleCensorType to trigger re-render
 const cycleCensorType = () => {
   if (selectedText.lineIndex === -1) return;
+  if (selectedText.layerId === -1) return;
 
   console.log('Applying censoring:', selectedText);
 
   // Find existing censor for this region
   const existingIndex = censoredRegions.value.findIndex(
-    region => region.lineIndex === selectedText.lineIndex &&
+    region => region.layerId === selectedText.layerId &&
+             region.lineIndex === selectedText.lineIndex &&
              region.startOffset === selectedText.startOffset &&
              region.endOffset === selectedText.endOffset
   );
@@ -1153,7 +1292,8 @@ const cycleCensorType = () => {
       lineIndex: selectedText.lineIndex,
       startOffset: selectedText.startOffset,
       endOffset: selectedText.endOffset,
-      type: CensorType.Invisible
+      type: CensorType.Invisible,
+      layerId: selectedText.layerId
     });
   } else {
     const current = censoredRegions.value[existingIndex];
@@ -1178,12 +1318,12 @@ const cycleCensorType = () => {
 };
 
 // Update applyCensoring to handle partial text censoring
-const applyCensoring = (text: string, lineIndex: number) => {
+const applyCensoring = (text: string, lineIndex: number, layerId: number) => {
   const regions = censoredRegions.value
-    .filter(region => region.lineIndex === lineIndex)
+    .filter(region => region.layerId === layerId && region.lineIndex === lineIndex)
     .sort((a, b) => a.startOffset - b.startOffset);
 
-  console.log(`Applying censoring to line ${lineIndex}, found ${regions.length} regions`);
+  console.log(`Applying censoring to layer ${layerId}, line ${lineIndex}, found ${regions.length} regions`);
 
   if (regions.length === 0) return text;
 
@@ -1229,10 +1369,11 @@ const applyCensoring = (text: string, lineIndex: number) => {
 // Update handleTextSelection to work with textarea
 const handleTextSelection = () => {
   const selection = window.getSelection();
-  console.log('Selection event triggered', selection?.toString());
+  // Avoid noisy logs; this handler runs on every cursor move
   
   if (!selection || selection.toString().trim() === '') {
     selectedText.lineIndex = -1;
+    selectedText.layerId = -1;
     return;
   }
 
@@ -1260,6 +1401,7 @@ const handleTextSelection = () => {
         selectedText.startOffset = selectionStart - lineStart;
         selectedText.endOffset = textarea.selectionEnd - lineStart;
         selectedText.text = selectedValue;
+        selectedText.layerId = activeChatLayer.value?.id ?? -1;
         break;
       }
       
@@ -1279,42 +1421,30 @@ const stripHtml = (html: string): string => {
   return temp.textContent || temp.innerText || '';
 };
 
-// Helper function to break text into lines
-const breakTextIntoLines = (text: string, ctx: CanvasRenderingContext2D, maxWidth: number): string[] => {
-  const words = text.split(' ');
-  const lines: string[] = [];
-  let currentLine = words[0];
-
-  for (let i = 1; i < words.length; i++) {
-    const word = words[i];
-    const width = ctx.measureText(currentLine + ' ' + word).width;
-    if (width < maxWidth) {
-      currentLine += ' ' + word;
-    } else {
-      lines.push(currentLine);
-      currentLine = word;
-    }
-  }
-  lines.push(currentLine);
-  return lines;
-};
-
 // Save editor state to cookie
 const saveEditorState = () => {
   const state = {
     characterName: characterName.value,
-    chatlogText: chatlogText.value,
+    chatLayers: chatLayers.value.map(layer => ({
+      id: layer.id,
+      name: layer.name,
+      text: layer.text,
+      transform: { ...layer.transform },
+      visible: layer.visible
+    })),
+    selectedChatLayerId: selectedChatLayerId.value,
     dropZoneWidth: dropZoneWidth.value,
     dropZoneHeight: dropZoneHeight.value,
     imageTransform: { ...imageTransform },
-    chatTransform: { ...chatTransform },
     isImageDraggingEnabled: isImageDraggingEnabled.value,
     isChatDraggingEnabled: isChatDraggingEnabled.value,
     showBlackBars: showBlackBars.value,
     censoredRegions: censoredRegions.value,
     selectedText: { ...selectedText },
     stripTimestamps: stripTimestamps.value,
-    chatLineWidth: chatLineWidth.value
+    chatLineWidth: chatLineWidth.value,
+    screenshotTheme: screenshotTheme.value,
+    alwaysPromptSaveLocation: alwaysPromptSaveLocation.value
   };
   Cookies.set('editorState', JSON.stringify(state), { expires: 365 });
 };
@@ -1326,23 +1456,50 @@ const loadEditorState = () => {
     try {
       const state = JSON.parse(savedState);
       characterName.value = state.characterName || '';
-      chatlogText.value = state.chatlogText || '';
       dropZoneWidth.value = state.dropZoneWidth || 800;
       dropZoneHeight.value = state.dropZoneHeight || 600;
       Object.assign(imageTransform, state.imageTransform || { x: 0, y: 0, scale: 1 });
-      Object.assign(chatTransform, state.chatTransform || { x: 0, y: 0, scale: 1 });
       isImageDraggingEnabled.value = state.isImageDraggingEnabled || false;
       isChatDraggingEnabled.value = state.isChatDraggingEnabled || false;
       showBlackBars.value = state.showBlackBars || false;
-      censoredRegions.value = state.censoredRegions || [];
-      Object.assign(selectedText, state.selectedText || { lineIndex: -1, startOffset: 0, endOffset: 0, text: '' });
+      const loadedRegions = state.censoredRegions || [];
+      censoredRegions.value = loadedRegions.map((region: any) => ({
+        layerId: region.layerId ?? activeChatLayer.value?.id ?? -1,
+        lineIndex: region.lineIndex ?? -1,
+        startOffset: region.startOffset ?? 0,
+        endOffset: region.endOffset ?? 0,
+        type: region.type ?? CensorType.Invisible
+      }));
+      Object.assign(selectedText, state.selectedText || { layerId: -1, lineIndex: -1, startOffset: 0, endOffset: 0, text: '' });
+      selectedText.layerId = selectedText.layerId ?? -1;
       stripTimestamps.value = state.stripTimestamps || false; // Load the new option
       chatLineWidth.value = state.chatLineWidth || 640;
-      
-      // If there's chat text, parse it
-      if (chatlogText.value) {
+      screenshotTheme.value = state.screenshotTheme || '';
+      alwaysPromptSaveLocation.value = state.alwaysPromptSaveLocation || false;
+
+      if (state.chatLayers && Array.isArray(state.chatLayers)) {
+        chatLayers.value = [];
+        for (const layer of state.chatLayers) {
+          const restored = createChatLayer({
+            id: layer.id,
+            name: layer.name,
+            text: layer.text,
+            transform: layer.transform,
+            visible: layer.visible
+          });
+          parseChatlog(restored);
+          nextChatLayerId = Math.max(nextChatLayerId, restored.id + 1);
+        }
+        const fallbackId = state.selectedChatLayerId ?? (chatLayers.value[0]?.id ?? null);
+        if (fallbackId !== null) {
+          selectChatLayer(fallbackId);
+        }
+      } else {
+        // Legacy state: single chatlogText
+        chatlogText.value = state.chatlogText || '';
         parseChatlog();
       }
+      
     } catch (error) {
       console.error('Error loading editor state:', error);
     }
@@ -1369,18 +1526,20 @@ const initializeLayoutValues = () => {
 
 // Watch for changes that should trigger state save
 watch([
-  chatlogText,
+  chatLayers,
+  selectedChatLayerId,
   dropZoneWidth,
   dropZoneHeight,
   () => ({ ...imageTransform }),
-  () => ({ ...chatTransform }),
   isImageDraggingEnabled,
   isChatDraggingEnabled,
   showBlackBars,
   censoredRegions,
   () => ({ ...selectedText }),
   stripTimestamps,
-  chatLineWidth
+  chatLineWidth,
+  screenshotTheme,
+  alwaysPromptSaveLocation
 ], () => {
   saveEditorState();
 }, { deep: true });
@@ -1466,6 +1625,41 @@ const handleDropZoneClick = (event: Event) => {
           @input="parseChatlog"
           prepend-inner-icon="mdi-account"
         ></v-text-field>
+      </div>
+
+      <v-spacer></v-spacer>
+
+      <div class="toolbar-button-group">
+        <v-text-field
+          v-model="screenshotTheme"
+          label="Screenshot Name"
+          density="compact"
+          hide-details
+          variant="solo-filled"
+          flat
+          style="max-width: 260px; min-width: 200px;"
+          class="mx-1"
+          prepend-inner-icon="mdi-tag-text-outline"
+          placeholder="screenshot"
+        ></v-text-field>
+        <v-tooltip
+          :text="filePickerSupported ? 'Ask where to save each time (uses browser Save dialog)' : 'Save dialog not supported in this browser'"
+          location="bottom"
+        >
+          <template v-slot:activator="{ props }">
+            <v-switch
+              v-bind="props"
+              v-model="alwaysPromptSaveLocation"
+              :disabled="!filePickerSupported"
+              color="primary"
+              density="compact"
+              hide-details
+              class="ms-2 me-1 custom-switch"
+              inset
+              aria-label="Prompt for save location"
+            ></v-switch>
+          </template>
+        </v-tooltip>
       </div>
 
       <v-spacer></v-spacer>
@@ -1657,9 +1851,10 @@ const handleDropZoneClick = (event: Event) => {
               'clickable': !droppedImageSrc 
             }" 
             :style="dropZoneStyle as CSSProperties"
-            @dragover="handleDragOver"
+            @dragover.prevent.stop="handleDragOver"
             @dragleave="handleDragLeave"
-            @drop="handleDrop"
+            @dragenter.prevent.stop="handleDragOver"
+            @drop.prevent.stop="handleDrop"
             @wheel="handleWheel"
             @click="handleDropZoneClick"
             :role="!droppedImageSrc ? 'button' : undefined"
@@ -1691,32 +1886,33 @@ const handleDropZoneClick = (event: Event) => {
             </div>
 
             <!-- Chat Overlay with fixed-width wrapping -->
-            <div v-if="parsedChatLines.length > 0 && droppedImageSrc" 
+            <template v-for="layer in chatLayers">
+              <div
+                v-if="droppedImageSrc && layer && layer.visible && layer.parsedLines && layer.parsedLines.length > 0"
+                :key="`chat-layer-${layer.id}-${renderKey}`"
                 class="chat-overlay"
-                :key="renderKey"
                 @mousedown="handleChatMouseDown"
                 @mousemove="handleChatMouseMove"
                 @mouseup="handleChatMouseUpOrLeave"
                 @mouseleave="handleChatMouseUpOrLeave"
                 @wheel="handleChatWheel"
-                :style="chatStyles"
-            >
-              <div class="chat-lines-container">
-                <div
-                  v-for="(line, index) in parsedChatLines"
-                  :key="line.id"
-                  class="chat-line"
-                  :style="{ color: line.color }"
-                >
-                  <!-- Conditionally wrap the text span for black bars -->
-                  <span v-if="showBlackBars" class="with-black-bar">
-                    <span class="chat-text" v-html="applyCensoring(line.text, index)" @mouseup="handleTextSelection"></span>
-                  </span>
-                  <!-- Render text directly if black bars are off -->
-                  <span v-else class="chat-text" v-html="applyCensoring(line.text, index)" @mouseup="handleTextSelection"></span>
+                :style="chatStyles(layer)"
+              >
+                <div class="chat-lines-container">
+                  <div
+                    v-for="(line, index) in layer.parsedLines"
+                    :key="line.id"
+                    class="chat-line"
+                    :style="{ color: line.color }"
+                  >
+                    <span v-if="showBlackBars" class="with-black-bar">
+                      <span class="chat-text" v-html="applyCensoring(line.text, index, layer.id)" @mouseup="handleTextSelection"></span>
+                    </span>
+                    <span v-else class="chat-text" v-html="applyCensoring(line.text, index, layer.id)" @mouseup="handleTextSelection"></span>
+                  </div>
                 </div>
               </div>
-            </div>
+            </template>
           </v-sheet>
         </div>
       </div>
@@ -1730,6 +1926,52 @@ const handleDropZoneClick = (event: Event) => {
       <!-- Right side chatlog panel -->
       <div class="chatlog-panel" ref="chatPanelRef" :style="{ width: chatPanelFlexBasis }">
         <v-sheet class="fill-height d-flex flex-column pa-2" style="border-radius: 4px;">
+          <div class="d-flex align-center mb-1">
+            <div class="text-subtitle-1">Chat Layers</div>
+            <v-spacer></v-spacer>
+            <v-btn icon="mdi-plus" size="small" variant="text" @click="addChatLayer"></v-btn>
+          </div>
+          <div class="mb-2" style="max-height: 180px; overflow-y: auto;">
+            <v-list density="compact" bg-color="transparent">
+              <v-list-item
+                v-for="(layer, index) in chatLayers"
+                :key="layer.id"
+                :active="layer.id === activeChatLayer?.id"
+                @click="selectChatLayer(layer.id)"
+              >
+                <template #prepend>
+                  <v-btn
+                    icon
+                    size="small"
+                    variant="text"
+                    :color="layer.visible ? 'primary' : undefined"
+                    :icon="layer.visible ? 'mdi-eye-outline' : 'mdi-eye-off-outline'"
+                    @click.stop="layer.visible = !layer.visible"
+                  ></v-btn>
+                </template>
+                <v-text-field
+                  v-model="layer.name"
+                  variant="underlined"
+                  density="compact"
+                  hide-details
+                  class="mx-2"
+                  placeholder="Layer name"
+                ></v-text-field>
+                <template #append>
+                  <v-btn icon size="small" variant="text" :disabled="index === 0" @click.stop="moveChatLayer(layer.id, 'up')">
+                    <v-icon size="small">mdi-arrow-up</v-icon>
+                  </v-btn>
+                  <v-btn icon size="small" variant="text" :disabled="index === chatLayers.length - 1" @click.stop="moveChatLayer(layer.id, 'down')">
+                    <v-icon size="small">mdi-arrow-down</v-icon>
+                  </v-btn>
+                  <v-btn icon size="small" variant="text" :disabled="chatLayers.length === 1" @click.stop="removeChatLayer(layer.id)">
+                    <v-icon size="small">mdi-delete-outline</v-icon>
+                  </v-btn>
+                </template>
+              </v-list-item>
+            </v-list>
+          </div>
+
           <div class="text-subtitle-1 mb-1">Chatlog Snippet</div>
           <div class="flex-grow-1 d-flex flex-column" style="overflow-y: hidden;">
             <v-textarea
@@ -2041,8 +2283,4 @@ const handleDropZoneClick = (event: Event) => {
   align-items: center;
 }
 </style>
-
-
-
-
 
