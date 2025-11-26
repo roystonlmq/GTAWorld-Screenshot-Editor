@@ -1,7 +1,7 @@
 // src/components/Magician.vue
 
 <script setup lang="ts">
-import { ref, computed, reactive, onMounted, watch } from 'vue';
+import { ref, computed, reactive, onMounted, watch, nextTick } from 'vue';
 import { type CSSProperties } from 'vue';
 import Cookies from 'js-cookie';
 import html2canvas from 'html2canvas';
@@ -20,6 +20,7 @@ interface ImageLayer {
   name: string;
   src: string | null;
   transform: { x: number; y: number; scale: number; rotation: number };
+  crop: { x: number; y: number; width: number; height: number };
   opacity: number;
   visible: boolean;
 }
@@ -31,6 +32,13 @@ const normalizeTransform = (t?: Partial<{ x: number; y: number; scale: number; r
   rotation: Number.isFinite(t?.rotation) ? t!.rotation! : 0,
 });
 
+const normalizeCrop = (c?: Partial<{ x: number; y: number; width: number; height: number }>) => ({
+  x: Number.isFinite(c?.x) ? Math.max(0, Math.min(100, c!.x!)) : 0,
+  y: Number.isFinite(c?.y) ? Math.max(0, Math.min(100, c!.y!)) : 0,
+  width: Number.isFinite(c?.width) ? Math.max(0, Math.min(100, c!.width!)) : 100,
+  height: Number.isFinite(c?.height) ? Math.max(0, Math.min(100, c!.height!)) : 100,
+});
+
 const chatLayers = ref<ChatLayer[]>([]);
 const selectedChatLayerId = ref<number | null>(null);
 let nextChatLayerId = 1;
@@ -38,6 +46,7 @@ let nextChatLayerId = 1;
 const imageLayers = ref<ImageLayer[]>([]);
 const selectedImageLayerId = ref<number | null>(null);
 let nextImageLayerId = 1;
+const activeImageEl = ref<HTMLImageElement | null>(null);
 
 const createChatLayer = (options?: Partial<ChatLayer>) => {
   const layer: ChatLayer = {
@@ -63,6 +72,7 @@ const createImageLayer = (options?: Partial<ImageLayer>) => {
     name: options?.name || `Image ${imageLayers.value.length + 1}`,
     src: options?.src ?? null,
     transform: normalizeTransform(options?.transform),
+    crop: normalizeCrop(options?.crop),
     opacity: Number.isFinite(options?.opacity) ? (options!.opacity as number) : 1,
     visible: options?.visible ?? true
   };
@@ -75,6 +85,7 @@ const selectImageLayer = (id: number) => {
   if (!layer) return;
   selectedImageLayerId.value = id;
   Object.assign(imageTransform, normalizeTransform(layer.transform));
+  nextTick(() => updateActiveImageBox());
 };
 
 const activeImageLayer = computed(() => {
@@ -112,12 +123,15 @@ const ensureActiveImageLayer = (): ImageLayer => {
   if (activeImageLayer.value) return activeImageLayer.value;
   const newLayer = createImageLayer({ name: `Image ${imageLayers.value.length + 1}` });
   selectedImageLayerId.value = newLayer.id;
+  Object.assign(cropBox, normalizeCrop(newLayer.crop));
+  nextTick(() => updateActiveImageBox());
   return newLayer;
 };
 const droppedImageSrc = ref<string | null>(null); // To store the image data URL
 const isDraggingOverDropZone = ref(false); // Renamed from isDragging for clarity
 const dropZoneWidth = ref<number | null>(800); // Default width
 const dropZoneHeight = ref<number | null>(600); // Default height
+const dropZoneRef = ref<HTMLElement | null | { $el?: HTMLElement }>(null); // Reference to dropzone for accurate scaling
 const fileInputRef = ref<HTMLInputElement | null>(null); // Ref for the file input element
 const chatFileInputRef = ref<HTMLInputElement | null>(null); // New ref for chat file input
 const showNewSessionDialog = ref(false); // Control dialog visibility
@@ -156,15 +170,28 @@ const imageTransform = reactive({ x: 0, y: 0, scale: 1 });
 const isPanning = ref(false);
 const panStart = reactive({ x: 0, y: 0 });
 const panStartImagePos = reactive({ x: 0, y: 0 });
+const isCropping = ref(false);
+const cropBox = reactive({ x: 0, y: 0, width: 100, height: 100 });
+const activeImageBox = reactive({ left: 0, top: 0, width: 0, height: 0 });
+const cropDrag = reactive({
+  active: false,
+  mode: 'move' as 'move' | 'left' | 'right' | 'top' | 'bottom' | 'topleft' | 'topright' | 'bottomleft' | 'bottomright',
+  startX: 0,
+  startY: 0,
+  startCrop: { x: 0, y: 0, width: 100, height: 100 }
+});
 
 watch(activeImageLayer, (layer) => {
   if (!layer) return;
   Object.assign(imageTransform, normalizeTransform(layer.transform));
+  Object.assign(cropBox, normalizeCrop(layer.crop));
+  nextTick(() => updateActiveImageBox());
 }, { immediate: true });
 
 const getPreviewScale = () => {
-  const dz = dropZoneRef.value;
-  if (dz && dropZoneWidth.value && dropZoneHeight.value) {
+  const dzRaw = dropZoneRef.value as any;
+  const dz = dzRaw?.$el ?? dzRaw;
+  if (dz && typeof dz.clientWidth === 'number' && dropZoneWidth.value && dropZoneHeight.value) {
     const scaleX = dz.clientWidth / dropZoneWidth.value;
     const scaleY = dz.clientHeight / dropZoneHeight.value;
     return Math.min(scaleX, scaleY) || 1;
@@ -177,6 +204,62 @@ watch(imageTransform, (val) => {
     Object.assign(activeImageLayer.value.transform, normalizeTransform(val));
   }
 }, { deep: true });
+
+watch(cropBox, (val) => {
+  if (activeImageLayer.value) {
+    activeImageLayer.value.crop = normalizeCrop(val);
+  }
+}, { deep: true });
+
+const updateActiveImageBox = () => {
+  const dzRaw = dropZoneRef.value as any;
+  const dzEl: HTMLElement | null = dzRaw?.$el ?? dzRaw ?? null;
+  const img = activeImageEl?.value;
+  if (!dzEl || typeof dzEl.getBoundingClientRect !== 'function' || !img) {
+    activeImageBox.left = 0;
+    activeImageBox.top = 0;
+    activeImageBox.width = 0;
+    activeImageBox.height = 0;
+    return;
+  }
+  const dzRect = dzEl.getBoundingClientRect();
+  const imgRect = img.getBoundingClientRect();
+  activeImageBox.left = imgRect.left - dzRect.left;
+  activeImageBox.top = imgRect.top - dzRect.top;
+  activeImageBox.width = imgRect.width;
+  activeImageBox.height = imgRect.height;
+};
+
+watch(
+  [() => ({ ...imageTransform }), activeImageLayer, dropZoneWidth, dropZoneHeight, isCropping],
+  () => nextTick(() => updateActiveImageBox()),
+  { deep: true }
+);
+
+watch(() => dropZoneRef.value, () => nextTick(() => updateActiveImageBox()));
+
+watch(imageLayers, (layers) => {
+  if (!layers.length) {
+    selectedImageLayerId.value = null;
+    if (activeImageEl) activeImageEl.value = null;
+    activeImageBox.left = 0;
+    activeImageBox.top = 0;
+    activeImageBox.width = 0;
+    activeImageBox.height = 0;
+    return;
+  }
+  const hasSelected = layers.some(l => l.id === selectedImageLayerId.value);
+  if (!hasSelected) {
+    selectedImageLayerId.value = layers[0].id;
+    Object.assign(cropBox, normalizeCrop(layers[0].crop));
+  }
+  nextTick(() => updateActiveImageBox());
+}, { deep: true });
+
+watch(selectedImageLayerId, () => {
+  if (activeImageEl) activeImageEl.value = null;
+  nextTick(() => updateActiveImageBox());
+});
 
 // --- Chat Manipulation State ---
 const isChatDraggingEnabled = ref(false);
@@ -199,7 +282,6 @@ watch(chatTransform, (val) => {
 
 // --- Scale Adjustment for Drop Zone Visibility ---
 const contentAreaRef = ref<HTMLElement | null>(null); // Reference to content area div
-const dropZoneRef = ref<HTMLElement | null>(null); // Reference to dropzone for accurate scaling
 const dropzoneScale = ref(1); // Scale factor for the dropzone to fit screen
 const isScaledDown = ref(false); // Flag to track if the dropzone is scaled down
 
@@ -387,6 +469,23 @@ const dropZoneStyle = computed(() => {
     border: isScaledDown.value ? '2px solid #42a5f5' : '2px dashed transparent' // Blue border when scaled
   };
 });
+
+const cropOverlayStyle = computed(() => ({
+  left: `${activeImageBox.left + (cropBox.x / 100) * activeImageBox.width}px`,
+  top: `${activeImageBox.top + (cropBox.y / 100) * activeImageBox.height}px`,
+  width: `${(cropBox.width / 100) * activeImageBox.width}px`,
+  height: `${(cropBox.height / 100) * activeImageBox.height}px`,
+  display: activeImageBox.width === 0 || activeImageBox.height === 0 ? 'none' : 'block'
+}));
+
+const cropClipPath = (layer: ImageLayer) => {
+  const crop = normalizeCrop(layer.crop);
+  const top = crop.y;
+  const left = crop.x;
+  const right = Math.max(0, 100 - (crop.x + crop.width));
+  const bottom = Math.max(0, 100 - (crop.y + crop.height));
+  return `inset(${top}% ${right}% ${bottom}% ${left}%)`;
+};
 
 // Aspect ratio container style - use the paddingTop technique to maintain ratio
 const aspectRatioContainerStyle = computed(() => {
@@ -745,12 +844,126 @@ const handleWheel = (event: WheelEvent) => {
   Object.assign(imageTransform, layer.transform);
 };
 
+// --- Image Crop Handlers ---
+const toggleCropMode = () => {
+  if (!activeImageLayer.value?.src) return;
+  isCropping.value = !isCropping.value;
+  if (isCropping.value) {
+    isImageDraggingEnabled.value = false;
+    isChatDraggingEnabled.value = false;
+    nextTick(() => updateActiveImageBox());
+  }
+  nextTick(() => updateActiveImageBox());
+};
+
+const clampValue = (val: number, min: number, max: number) => Math.min(max, Math.max(min, val));
+
+const startCropDrag = (mode: typeof cropDrag.mode, event: MouseEvent) => {
+  if (!isCropping.value || !activeImageLayer.value) return;
+  if (!activeImageBox.width || !activeImageBox.height) return;
+  event.preventDefault();
+  event.stopPropagation();
+  cropDrag.active = true;
+  cropDrag.mode = mode;
+  cropDrag.startX = event.clientX;
+  cropDrag.startY = event.clientY;
+  cropDrag.startCrop = { ...cropBox };
+  document.addEventListener('mousemove', handleCropMouseMove);
+  document.addEventListener('mouseup', stopCropDrag);
+};
+
+const stopCropDrag = () => {
+  if (!cropDrag.active) return;
+  cropDrag.active = false;
+  document.removeEventListener('mousemove', handleCropMouseMove);
+  document.removeEventListener('mouseup', stopCropDrag);
+};
+
+const handleCropMouseMove = (event: MouseEvent) => {
+  if (!cropDrag.active) return;
+  if (!activeImageBox.width || !activeImageBox.height) return;
+
+  const dxPct = ((event.clientX - cropDrag.startX) / activeImageBox.width) * 100;
+  const dyPct = ((event.clientY - cropDrag.startY) / activeImageBox.height) * 100;
+
+  const minSize = 5;
+  const start = cropDrag.startCrop;
+  const rightEdge = start.x + start.width;
+  const bottomEdge = start.y + start.height;
+
+  let newX = start.x;
+  let newY = start.y;
+  let newWidth = start.width;
+  let newHeight = start.height;
+
+  switch (cropDrag.mode) {
+    case 'move':
+      newX = clampValue(start.x + dxPct, 0, 100 - start.width);
+      newY = clampValue(start.y + dyPct, 0, 100 - start.height);
+      break;
+    case 'left':
+      newX = clampValue(start.x + dxPct, 0, rightEdge - minSize);
+      newWidth = rightEdge - newX;
+      break;
+    case 'right': {
+      const newRight = clampValue(rightEdge + dxPct, start.x + minSize, 100);
+      newWidth = newRight - start.x;
+      break;
+    }
+    case 'top':
+      newY = clampValue(start.y + dyPct, 0, bottomEdge - minSize);
+      newHeight = bottomEdge - newY;
+      break;
+    case 'bottom': {
+      const newBottom = clampValue(bottomEdge + dyPct, start.y + minSize, 100);
+      newHeight = newBottom - start.y;
+      break;
+    }
+    case 'topleft':
+      newX = clampValue(start.x + dxPct, 0, rightEdge - minSize);
+      newY = clampValue(start.y + dyPct, 0, bottomEdge - minSize);
+      newWidth = rightEdge - newX;
+      newHeight = bottomEdge - newY;
+      break;
+    case 'topright': {
+      const newRight = clampValue(rightEdge + dxPct, start.x + minSize, 100);
+      newY = clampValue(start.y + dyPct, 0, bottomEdge - minSize);
+      newWidth = newRight - start.x;
+      newHeight = bottomEdge - newY;
+      break;
+    }
+    case 'bottomleft': {
+      const newBottom = clampValue(bottomEdge + dyPct, start.y + minSize, 100);
+      newX = clampValue(start.x + dxPct, 0, rightEdge - minSize);
+      newWidth = rightEdge - newX;
+      newHeight = newBottom - start.y;
+      break;
+    }
+    case 'bottomright': {
+      const newRight = clampValue(rightEdge + dxPct, start.x + minSize, 100);
+      const newBottom = clampValue(bottomEdge + dyPct, start.y + minSize, 100);
+      newWidth = newRight - start.x;
+      newHeight = newBottom - start.y;
+      break;
+    }
+  }
+
+  cropBox.x = clampValue(newX, 0, 100 - minSize);
+  cropBox.y = clampValue(newY, 0, 100 - minSize);
+  cropBox.width = clampValue(newWidth, minSize, 100 - cropBox.x);
+  cropBox.height = clampValue(newHeight, minSize, 100 - cropBox.y);
+};
+
 // --- Toolbar Button Handlers ---
 const toggleImageDrag = () => {
   isImageDraggingEnabled.value = !isImageDraggingEnabled.value;
   if (isImageDraggingEnabled.value && isChatDraggingEnabled.value) {
     isChatDraggingEnabled.value = false; // Disable chat drag if enabling image drag
   }
+  if (isImageDraggingEnabled.value) {
+    isCropping.value = false;
+  }
+  nextTick(() => updateActiveImageBox());
 };
 
 // --- Chat Dragging Handlers ---
@@ -827,6 +1040,9 @@ const toggleChatDrag = () => {
   isChatDraggingEnabled.value = !isChatDraggingEnabled.value;
   if (isChatDraggingEnabled.value && isImageDraggingEnabled.value) {
     isImageDraggingEnabled.value = false; // Disable image drag if enabling chat drag
+  }
+  if (isChatDraggingEnabled.value) {
+    isCropping.value = false;
   }
 };
 
@@ -911,6 +1127,30 @@ const handleResizeMouseUp = () => {
   document.removeEventListener('mouseup', handleResizeMouseUp);
   
   console.log("Resize complete");
+};
+
+const addImageLayer = () => {
+  const layer = createImageLayer({ name: `Image ${imageLayers.value.length + 1}` });
+  selectedImageLayerId.value = layer.id;
+  Object.assign(imageTransform, normalizeTransform(layer.transform));
+  Object.assign(cropBox, normalizeCrop(layer.crop));
+  nextTick(() => updateActiveImageBox());
+};
+
+const removeImageLayer = (id: number) => {
+  if (imageLayers.value.length <= 1) return;
+  const idx = imageLayers.value.findIndex(l => l.id === id);
+  if (idx === -1) return;
+  imageLayers.value.splice(idx, 1);
+  const fallback = imageLayers.value[idx - 1] || imageLayers.value[0];
+  selectedImageLayerId.value = fallback?.id ?? null;
+  if (fallback) {
+    Object.assign(imageTransform, normalizeTransform(fallback.transform));
+    Object.assign(cropBox, normalizeCrop(fallback.crop));
+  } else {
+    activeImageEl.value = null;
+  }
+  nextTick(() => updateActiveImageBox());
 };
 
 // Replace chatLineStyle with a direct rendering approach
@@ -1036,6 +1276,7 @@ const saveImage = async () => {
       if (!layer.src || !layer.visible) continue;
       ctx.save();
       const t = normalizeTransform(layer.transform);
+      const crop = normalizeCrop(layer.crop);
       const img = new Image();
       img.src = layer.src;
       await new Promise((resolve, reject) => {
@@ -1063,6 +1304,18 @@ const saveImage = async () => {
       ctx.translate(t.x, t.y);
       ctx.rotate((t.rotation * Math.PI) / 180);
       ctx.scale(t.scale, t.scale);
+
+      // Apply crop relative to the image box
+      const cropRect = {
+        x: (-drawWidth / 2) + (crop.x / 100) * drawWidth,
+        y: (-drawHeight / 2) + (crop.y / 100) * drawHeight,
+        width: (crop.width / 100) * drawWidth,
+        height: (crop.height / 100) * drawHeight
+      };
+      ctx.beginPath();
+      ctx.rect(cropRect.x, cropRect.y, cropRect.width, cropRect.height);
+      ctx.clip();
+
       const prevAlpha = ctx.globalAlpha;
       ctx.globalAlpha = layer.opacity ?? 1;
       ctx.drawImage(img, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
@@ -1322,6 +1575,9 @@ const resetSession = () => {
   const imgLayer = createImageLayer({ name: 'Image 1' });
   selectedImageLayerId.value = imgLayer.id;
   Object.assign(imageTransform, imgLayer.transform);
+  if (activeImageEl) activeImageEl.value = null;
+  Object.assign(cropBox, normalizeCrop(imgLayer.crop));
+  nextTick(() => updateActiveImageBox());
   
   // Reset image dragging state
   isImageDraggingEnabled.value = false;
@@ -1565,6 +1821,7 @@ const saveEditorState = () => {
       name: layer.name,
       src: layer.src,
       transform: { ...layer.transform },
+      crop: { ...layer.crop },
       opacity: layer.opacity,
       visible: layer.visible
     })),
@@ -1622,6 +1879,7 @@ const loadEditorState = () => {
             name: layer.name,
             src: layer.src,
             transform: normalizeTransform(layer.transform),
+            crop: normalizeCrop(layer.crop),
             opacity: layer.opacity,
             visible: layer.visible
           });
@@ -1717,7 +1975,9 @@ onMounted(() => {
     // Add window resize listener
     window.addEventListener('resize', () => {
       calculateDropzoneScale();
+      updateActiveImageBox();
     });
+    updateActiveImageBox();
   }, 100);
 });
 
@@ -1726,6 +1986,13 @@ const handleDropZoneClick = (event: Event) => {
   if (!hasImages.value) {
     triggerFileInput();
   }
+};
+
+const setActiveImageRef = (layerId: number, el: Element | null) => {
+  if (layerId !== activeImageLayer.value?.id) return;
+  if (!activeImageEl) return;
+  activeImageEl.value = (el as HTMLImageElement) || null;
+  nextTick(() => updateActiveImageBox());
 };
 
 </script>
@@ -1871,6 +2138,17 @@ const handleDropZoneClick = (event: Event) => {
               icon="mdi-drag-variant"
               :color="isImageDraggingEnabled ? 'primary' : undefined"
               @click="toggleImageDrag"
+            ></v-btn>
+          </template>
+        </v-tooltip>
+        <v-tooltip text="Crop Active Image" location="bottom">
+          <template v-slot:activator="{ props }">
+            <v-btn 
+              v-bind="props" 
+              icon="mdi-crop"
+              :color="isCropping ? 'primary' : undefined"
+              :disabled="!activeImageLayer?.src"
+              @click="toggleCropMode"
             ></v-btn>
           </template>
         </v-tooltip>
@@ -2026,37 +2304,59 @@ const handleDropZoneClick = (event: Event) => {
             </div>
             
             <!-- Display Images -->
-            <template v-for="layer in imageLayers">
-              <img 
-                v-if="layer.src && layer.visible"
-                :key="`image-layer-${layer.id}`"
-                :src="layer.src" 
-                :alt="layer.name"
-                class="dropped-image"
-                :style="{
-                  maxWidth: 'none',
-                  maxHeight: 'none',
-                  position: 'absolute',
-                  top: '0',
-                  left: '0',
-                  transformOrigin: 'center center',
-                  transform: `translate(${layer.transform.x * getPreviewScale()}px, ${layer.transform.y * getPreviewScale()}px) rotate(${layer.transform.rotation}deg) scale(${layer.transform.scale})`,
-                  cursor: isImageDraggingEnabled ? (isPanning ? 'grabbing' : 'grab') : 'default',
-                  transition: isPanning ? 'none' : 'transform 0.1s ease-out',
-                  opacity: layer.visible ? layer.opacity ?? 1 : 0.25,
-                  filter: layer.visible ? 'none' : 'grayscale(1)'
-                }"
-                draggable="false" 
-                @mousedown="(ev) => { selectImageLayer(layer.id); handleImageMouseDown(ev); }"
-                @mousemove="handleImageMouseMove"
-                @mouseup="handleImageMouseUpOrLeave"
-                @mouseleave="handleImageMouseUpOrLeave"
-              />
-            </template>
+      <template v-for="layer in imageLayers">
+        <img 
+          v-if="layer.src && layer.visible"
+              :key="`image-layer-${layer.id}`"
+              :src="layer.src" 
+              :alt="layer.name"
+              class="dropped-image"
+          :ref="(el) => setActiveImageRef(layer.id, el)"
+              :style="{
+                maxWidth: 'none',
+                maxHeight: 'none',
+                position: 'absolute',
+                top: '0',
+              left: '0',
+              transformOrigin: 'center center',
+              transform: `translate(${layer.transform.x * getPreviewScale()}px, ${layer.transform.y * getPreviewScale()}px) rotate(${layer.transform.rotation}deg) scale(${layer.transform.scale})`,
+              cursor: isImageDraggingEnabled ? (isPanning ? 'grabbing' : 'grab') : 'default',
+              transition: isPanning ? 'none' : 'transform 0.1s ease-out',
+              opacity: layer.visible ? layer.opacity ?? 1 : 0.25,
+              filter: layer.visible ? 'none' : 'grayscale(1)',
+              pointerEvents: layer.id === activeImageLayer?.id ? 'auto' : 'none',
+              clipPath: cropClipPath(layer),
+              WebkitClipPath: cropClipPath(layer)
+            }"
+            draggable="false" 
+            @mousedown="(ev) => { if (layer.id === activeImageLayer?.id) { handleImageMouseDown(ev); } }"
+            @load="() => updateActiveImageBox()"
+            @mousemove="handleImageMouseMove"
+            @mouseup="handleImageMouseUpOrLeave"
+            @mouseleave="handleImageMouseUpOrLeave"
+          />
+        </template>
             <!-- Display Placeholder -->
             <div v-if="!hasImages" class="text-center">
               <v-icon size="x-large" color="grey-darken-1">mdi-paperclip</v-icon>
               <div class="text-grey-darken-1 mt-2">Click or drag and drop your screenshot here</div>
+            </div>
+
+            <!-- Crop overlay for active image -->
+            <div
+              v-if="isCropping && activeImageLayer?.src"
+              class="crop-overlay"
+              :style="cropOverlayStyle"
+              @mousedown.stop.prevent="(e) => startCropDrag('move', e)"
+            >
+              <div class="crop-handle handle-tl" @mousedown.stop.prevent="(e) => startCropDrag('topleft', e)"></div>
+              <div class="crop-handle handle-tr" @mousedown.stop.prevent="(e) => startCropDrag('topright', e)"></div>
+              <div class="crop-handle handle-bl" @mousedown.stop.prevent="(e) => startCropDrag('bottomleft', e)"></div>
+              <div class="crop-handle handle-br" @mousedown.stop.prevent="(e) => startCropDrag('bottomright', e)"></div>
+              <div class="crop-handle handle-top" @mousedown.stop.prevent="(e) => startCropDrag('top', e)"></div>
+              <div class="crop-handle handle-bottom" @mousedown.stop.prevent="(e) => startCropDrag('bottom', e)"></div>
+              <div class="crop-handle handle-left" @mousedown.stop.prevent="(e) => startCropDrag('left', e)"></div>
+              <div class="crop-handle handle-right" @mousedown.stop.prevent="(e) => startCropDrag('right', e)"></div>
             </div>
 
             <!-- Chat Overlay with fixed-width wrapping -->
@@ -2126,20 +2426,20 @@ const handleDropZoneClick = (event: Event) => {
                   class="mx-2"
                   placeholder="Image name"
                 ></v-text-field>
-                <template #append>
-                  <v-btn icon size="small" variant="text" :disabled="index === 0" @click.stop="[imageLayers[index - 1], imageLayers[index]] = [imageLayers[index], imageLayers[index - 1]]; renderKey++">
-                    <v-icon size="small">mdi-arrow-up</v-icon>
-                  </v-btn>
-                  <v-btn icon size="small" variant="text" :disabled="index === imageLayers.length - 1" @click.stop="[imageLayers[index + 1], imageLayers[index]] = [imageLayers[index], imageLayers[index + 1]]; renderKey++">
-                    <v-icon size="small">mdi-arrow-down</v-icon>
-                  </v-btn>
-                  <v-btn icon size="small" variant="text" :disabled="imageLayers.length === 1" @click.stop="imageLayers.splice(index,1); renderKey++">
-                    <v-icon size="small">mdi-delete-outline</v-icon>
-                  </v-btn>
-                </template>
-              </v-list-item>
-            </v-list>
-            <v-btn block size="small" variant="tonal" class="mt-1" @click="() => { const l = createImageLayer({ name: `Image ${imageLayers.length + 1}` }); selectedImageLayerId = l.id; }">Add Image Layer</v-btn>
+            <template #append>
+              <v-btn icon size="small" variant="text" :disabled="index === 0" @click.stop="[imageLayers[index - 1], imageLayers[index]] = [imageLayers[index], imageLayers[index - 1]]; renderKey++">
+                <v-icon size="small">mdi-arrow-up</v-icon>
+              </v-btn>
+              <v-btn icon size="small" variant="text" :disabled="index === imageLayers.length - 1" @click.stop="[imageLayers[index + 1], imageLayers[index]] = [imageLayers[index], imageLayers[index + 1]]; renderKey++">
+                <v-icon size="small">mdi-arrow-down</v-icon>
+              </v-btn>
+              <v-btn icon size="small" variant="text" :disabled="imageLayers.length === 1" @click.stop="removeImageLayer(layer.id); renderKey++">
+                <v-icon size="small">mdi-delete-outline</v-icon>
+              </v-btn>
+            </template>
+          </v-list-item>
+        </v-list>
+        <v-btn block size="small" variant="tonal" class="mt-1" @click="addImageLayer">Add Image Layer</v-btn>
             <div v-if="activeImageLayer" class="mt-2">
               <v-slider
                 v-model="activeImageLayer.opacity"
@@ -2521,5 +2821,31 @@ const handleDropZoneClick = (event: Event) => {
   display: inline-flex; /* Helps with alignment in flex containers */
   align-items: center;
 }
-</style>
 
+.crop-overlay {
+  position: absolute;
+  border: 2px dashed #4caf50;
+  box-sizing: border-box;
+  cursor: move;
+  z-index: 6;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.crop-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: #4caf50;
+  border: 2px solid #fff;
+  box-sizing: border-box;
+}
+
+.handle-tl { top: -8px; left: -8px; cursor: nwse-resize; }
+.handle-tr { top: -8px; right: -8px; cursor: nesw-resize; }
+.handle-bl { bottom: -8px; left: -8px; cursor: nesw-resize; }
+.handle-br { bottom: -8px; right: -8px; cursor: nwse-resize; }
+.handle-top { top: -8px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.handle-bottom { bottom: -8px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.handle-left { left: -8px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+.handle-right { right: -8px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+</style>
